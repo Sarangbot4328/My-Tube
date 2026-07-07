@@ -333,10 +333,8 @@ final class ExtractorBridge {
         );
     }
 
-    private static PlaybackData innerTubeResolve(String url) throws Exception {
-        String videoId = extractVideoId(url);
-        if (videoId.isEmpty()) return null;
-
+    // Raw iOS-client player response for a video id (used by playback and download).
+    private static String iosPlayerResponse(String videoId) throws Exception {
         String payload = "{"
                 + "\"context\":{\"client\":{"
                 + "\"clientName\":\"IOS\","
@@ -347,17 +345,64 @@ final class ExtractorBridge {
                 + "\"videoId\":\"" + jsonEscape(videoId) + "\","
                 + "\"contentCheckOk\":true,\"racyCheckOk\":true"
                 + "}";
-
         Map<String, String> headers = new HashMap<>();
         headers.put("User-Agent", IOS_USER_AGENT);
         headers.put("X-YouTube-Client-Name", "5");
         headers.put("X-YouTube-Client-Version", IOS_CLIENT_VERSION);
-
-        String response = httpPost(
+        return httpPost(
                 "https://www.youtube.com/youtubei/v1/player?key=" + IOS_API_KEY + "&prettyPrint=false",
                 payload,
                 headers
         );
+    }
+
+    // A downloadable progressive (muxed audio+video) stream for one quality.
+    static final class DownloadOption {
+        final String label;   // e.g. "720p"
+        final String url;
+        final String ext;     // "mp4" / "webm"
+        final String mime;
+        DownloadOption(String label, String url, String ext, String mime) {
+            this.label = label;
+            this.url = url;
+            this.ext = ext;
+            this.mime = mime;
+        }
+    }
+
+    // Lists the progressive (single-file) qualities that can be downloaded without
+    // muxing. Adaptive-only videos return an empty list.
+    static List<DownloadOption> downloadOptions(String url) throws Exception {
+        init();
+        String videoId = extractVideoId(url);
+        if (videoId.isEmpty()) return new ArrayList<>();
+        String response = iosPlayerResponse(videoId);
+
+        List<DownloadOption> options = new ArrayList<>();
+        int start = response.indexOf("\"formats\":[");
+        if (start < 0) return options;
+        start += "\"formats\":[".length();
+        int end = response.indexOf(']', start);
+        if (end < 0) return options;
+
+        String[] entries = response.substring(start, end).split("\\},\\{");
+        for (String entry : entries) {
+            String streamUrl = cleanUrl(match(entry, "\"url\":\"([^\"]+)\""));
+            if (streamUrl.isEmpty()) continue;   // ciphered stream, not directly usable
+            String mime = clean(match(entry, "\"mimeType\":\"([^\"]+)\""));
+            String label = match(entry, "\"qualityLabel\":\"([^\"]+)\"");
+            String ext = mime.contains("webm") ? "webm" : "mp4";
+            String cleanMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')) : mime;
+            options.add(new DownloadOption(label.isEmpty() ? "기본 화질" : label, streamUrl, ext, cleanMime));
+        }
+        return options;
+    }
+
+    private static PlaybackData innerTubeResolve(String url) throws Exception {
+        String videoId = extractVideoId(url);
+        if (videoId.isEmpty()) return null;
+
+        String response = iosPlayerResponse(videoId);
 
         // Only serve a playable video: bail if YouTube reports it can't be played.
         String status = match(response, "\"playabilityStatus\":\\{\"status\":\"([^\"]+)\"");
@@ -421,6 +466,10 @@ final class ExtractorBridge {
         Matcher matcher = Pattern.compile("\"" + key + "\":\"((?:\\\\.|[^\"\\\\])*)\"", Pattern.DOTALL)
                 .matcher(text);
         return matcher.find() ? clean(matcher.group(1)) : "";
+    }
+
+    static String videoIdOf(String url) {
+        return extractVideoId(url);
     }
 
     private static String extractVideoId(String url) {

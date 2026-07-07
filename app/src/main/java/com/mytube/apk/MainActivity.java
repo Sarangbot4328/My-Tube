@@ -1,12 +1,16 @@
 package com.mytube.apk;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.PictureInPictureParams;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Rational;
@@ -15,6 +19,7 @@ import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -28,6 +33,7 @@ import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
 import androidx.media3.ui.TrackSelectionDialogBuilder;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -35,6 +41,11 @@ import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     public enum Tab { YOUTUBE, HOME, VIDEOS, SHORTS, CHANNELS }
+
+    private static final int SCREEN_SEARCH = 0;
+    private static final int SCREEN_DOWNLOADS = 1;
+    private static final int SCREEN_SETTINGS = 2;
+    private static final int REQUEST_FOLDER = 42;
 
     private static final class SortOption {
         final String label;
@@ -54,34 +65,47 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final List<Button> tabButtons = new ArrayList<>();
     private final List<Button> sortButtons = new ArrayList<>();
+    private final List<Button> navButtons = new ArrayList<>();
     private final List<TubeItem> results = new ArrayList<>();
 
     private ImageLoader imageLoader;
-    private EditText searchInput;
-    private TextView statusView;
-    private TextView metaView;
-    private LinearLayout resultsList;
-    private PlayerView playerView;
     private ExoPlayer player;
-    private Tab currentTab = Tab.YOUTUBE;
-    private ExtractorBridge.SortOrder currentSort = ExtractorBridge.SortOrder.RELEVANCE;
 
-    // Views toggled during fullscreen / popup playback.
+    // Screens.
+    private LinearLayout searchScreen;
+    private LinearLayout downloadScreen;
+    private LinearLayout settingsScreen;
+    private LinearLayout bottomNav;
+    private int currentScreen = SCREEN_SEARCH;
+
+    // Search screen views.
+    private EditText searchInput;
     private LinearLayout searchRow;
     private LinearLayout sortRow;
-    private ScrollView scrollView;
-    private ScrollView metaScroll;
-    private LinearLayout tabsBar;
+    private TextView statusView;
+    private ScrollView resultsScroll;
+    private LinearLayout resultsList;
+    private PlayerView playerView;
     private LinearLayout playerBar;
+    private Button downloadButton;
+    private ScrollView metaScroll;
+    private TextView metaView;
+
+    // Downloads / settings views.
+    private LinearLayout downloadList;
+    private TextView downloadEmpty;
+    private TextView folderText;
+
+    private ExtractorBridge.SortOrder currentSort = ExtractorBridge.SortOrder.RELEVANCE;
+    private ExtractorBridge.SearchSession session;
+    private TubeItem currentItem;
 
     private boolean fullscreen;
     private boolean playing;
+    private boolean offlinePlaying;
     private boolean loadingMore;
     private int searchToken;
-
-    private ExtractorBridge.SearchSession session;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -89,13 +113,48 @@ public final class MainActivity extends Activity {
         imageLoader = new ImageLoader(executor, mainHandler);
         player = new ExoPlayer.Builder(this).build();
         setContentView(buildUi());
-        selectTab(Tab.YOUTUBE);
+        showScreen(SCREEN_SEARCH);
+        runSearch();
     }
 
-    private LinearLayout buildUi() {
+    private View buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(248, 249, 251));
+        // targetSdk 35 draws edge-to-edge, so pad by the system bar insets to keep
+        // the search bar out from under the status bar and the nav out from under
+        // the gesture bar.
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            v.setPadding(0, insets.getSystemWindowInsetTop(), 0, insets.getSystemWindowInsetBottom());
+            return insets;
+        });
+
+        FrameLayout content = new FrameLayout(this);
+        searchScreen = buildSearchScreen();
+        downloadScreen = buildDownloadScreen();
+        settingsScreen = buildSettingsScreen();
+        content.addView(searchScreen);
+        content.addView(downloadScreen);
+        content.addView(settingsScreen);
+        root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        bottomNav = new LinearLayout(this);
+        bottomNav.setOrientation(LinearLayout.HORIZONTAL);
+        bottomNav.setBackgroundColor(Color.rgb(11, 15, 20));
+        addNavButton("유튜브", SCREEN_SEARCH);
+        addNavButton("다운로드", SCREEN_DOWNLOADS);
+        addNavButton("설정", SCREEN_SETTINGS);
+        root.addView(bottomNav, new LinearLayout.LayoutParams(-1, dp(60)));
+
+        return root;
+    }
+
+    // ---- Search screen -----------------------------------------------------
+
+    private LinearLayout buildSearchScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
 
         searchRow = new LinearLayout(this);
         searchRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -122,42 +181,31 @@ public final class MainActivity extends Activity {
         searchButton.setText("검색");
         searchButton.setOnClickListener(v -> runSearch());
         searchRow.addView(searchButton, new LinearLayout.LayoutParams(dp(78), dp(46)));
-        root.addView(searchRow);
+        screen.addView(searchRow);
 
-        // Sort filter row.
         sortRow = new LinearLayout(this);
         sortRow.setOrientation(LinearLayout.HORIZONTAL);
         sortRow.setPadding(dp(10), 0, dp(10), dp(6));
-        for (SortOption option : SORTS) {
-            addSortButton(sortRow, option);
-        }
-        root.addView(sortRow);
+        for (SortOption option : SORTS) addSortButton(sortRow, option);
+        screen.addView(sortRow);
 
         playerView = new PlayerView(this);
         playerView.setPlayer(player);
         playerView.setVisibility(View.GONE);
-        // Enables the controller's fullscreen button and routes taps to us.
         playerView.setFullscreenButtonClickListener(this::setFullscreen);
-        root.addView(playerView, new LinearLayout.LayoutParams(-1, dp(220)));
+        screen.addView(playerView, new LinearLayout.LayoutParams(-1, dp(220)));
 
         playerBar = new LinearLayout(this);
         playerBar.setOrientation(LinearLayout.HORIZONTAL);
         playerBar.setGravity(Gravity.END);
-        playerBar.setPadding(dp(12), dp(4), dp(12), 0);
+        playerBar.setPadding(dp(10), dp(4), dp(10), 0);
         playerBar.setVisibility(View.GONE);
-        Button popupButton = new Button(this);
-        popupButton.setText("팝업");
-        popupButton.setAllCaps(false);
-        popupButton.setOnClickListener(v -> enterPopup());
-        playerBar.addView(popupButton, new LinearLayout.LayoutParams(-2, dp(40)));
-        Button qualityButton = new Button(this);
-        qualityButton.setText("화질");
-        qualityButton.setAllCaps(false);
-        qualityButton.setOnClickListener(v -> showQualityDialog());
-        playerBar.addView(qualityButton, new LinearLayout.LayoutParams(-2, dp(40)));
-        root.addView(playerBar);
+        addPlayerBarButton("목록", v -> closePlayer());
+        addPlayerBarButton("팝업", v -> enterPopup());
+        addPlayerBarButton("화질", v -> showQualityDialog());
+        downloadButton = addPlayerBarButton("다운로드", v -> onDownloadClicked());
+        screen.addView(playerBar);
 
-        // Scrollable metadata panel (views, likes, date, description, tags).
         metaScroll = new ScrollView(this);
         metaScroll.setVisibility(View.GONE);
         metaScroll.setBackgroundColor(Color.WHITE);
@@ -167,49 +215,41 @@ public final class MainActivity extends Activity {
         metaView.setPadding(dp(16), dp(10), dp(16), dp(10));
         metaView.setTextIsSelectable(true);
         metaScroll.addView(metaView);
-        root.addView(metaScroll, new LinearLayout.LayoutParams(-1, dp(150)));
+        screen.addView(metaScroll, new LinearLayout.LayoutParams(-1, dp(150)));
 
         statusView = new TextView(this);
         statusView.setTextColor(Color.rgb(71, 85, 105));
         statusView.setTextSize(14);
         statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
-        root.addView(statusView, new LinearLayout.LayoutParams(-1, dp(42)));
+        screen.addView(statusView, new LinearLayout.LayoutParams(-1, dp(42)));
 
-        scrollView = new ScrollView(this);
+        resultsScroll = new ScrollView(this);
         resultsList = new LinearLayout(this);
         resultsList.setOrientation(LinearLayout.VERTICAL);
         resultsList.setPadding(dp(10), 0, dp(10), dp(10));
-        scrollView.addView(resultsList);
-        // Load more results as the user nears the bottom (infinite scroll).
-        scrollView.setOnScrollChangeListener((v, sx, sy, osx, osy) -> {
-            View child = scrollView.getChildAt(0);
+        resultsScroll.addView(resultsList);
+        resultsScroll.setOnScrollChangeListener((v, sx, sy, osx, osy) -> {
+            View child = resultsScroll.getChildAt(0);
             if (child == null) return;
-            int remaining = child.getHeight() - (scrollView.getHeight() + sy);
+            int remaining = child.getHeight() - (resultsScroll.getHeight() + sy);
             if (remaining < dp(600)) maybeLoadMore();
         });
-        root.addView(scrollView, new LinearLayout.LayoutParams(-1, 0, 1));
+        screen.addView(resultsScroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        tabsBar = new LinearLayout(this);
-        tabsBar.setOrientation(LinearLayout.HORIZONTAL);
-        tabsBar.setBackgroundColor(Color.rgb(11, 15, 20));
-        addTabButton(tabsBar, "유튜브", Tab.YOUTUBE);
-        addTabButton(tabsBar, "홈", Tab.HOME);
-        addTabButton(tabsBar, "동영상", Tab.VIDEOS);
-        addTabButton(tabsBar, "쇼츠", Tab.SHORTS);
-        addTabButton(tabsBar, "채널", Tab.CHANNELS);
-        root.addView(tabsBar, new LinearLayout.LayoutParams(-1, dp(64)));
-
-        return root;
+        return screen;
     }
 
-    private void addTabButton(LinearLayout parent, String label, Tab tab) {
+    private Button addPlayerBarButton(String label, View.OnClickListener onClick) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(12);
         button.setAllCaps(false);
-        button.setOnClickListener(v -> selectTab(tab));
-        tabButtons.add(button);
-        parent.addView(button, new LinearLayout.LayoutParams(0, -1, 1));
+        button.setTextSize(12);
+        button.setPadding(dp(6), 0, dp(6), 0);
+        button.setOnClickListener(onClick);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(40));
+        lp.setMargins(dp(3), 0, 0, 0);
+        playerBar.addView(button, lp);
+        return button;
     }
 
     private void addSortButton(LinearLayout parent, SortOption option) {
@@ -239,17 +279,250 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void selectTab(Tab tab) {
-        currentTab = tab;
-        for (int i = 0; i < tabButtons.size(); i++) {
-            Button button = tabButtons.get(i);
-            boolean selected = Tab.values()[i] == tab;
+    // ---- Downloads screen --------------------------------------------------
+
+    private LinearLayout buildDownloadScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setVisibility(View.GONE);
+        screen.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+
+        TextView title = new TextView(this);
+        title.setText("다운로드");
+        title.setTextColor(Color.rgb(15, 23, 42));
+        title.setTextSize(20);
+        title.setPadding(dp(16), dp(14), dp(16), dp(10));
+        screen.addView(title);
+
+        downloadEmpty = new TextView(this);
+        downloadEmpty.setText("다운로드한 영상이 없습니다.");
+        downloadEmpty.setTextColor(Color.rgb(100, 116, 139));
+        downloadEmpty.setPadding(dp(16), dp(8), dp(16), dp(8));
+        screen.addView(downloadEmpty);
+
+        ScrollView scroll = new ScrollView(this);
+        downloadList = new LinearLayout(this);
+        downloadList.setOrientation(LinearLayout.VERTICAL);
+        downloadList.setPadding(dp(10), 0, dp(10), dp(10));
+        scroll.addView(downloadList);
+        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        return screen;
+    }
+
+    private void refreshDownloadList() {
+        downloadList.removeAllViews();
+        List<DownloadItem> items = DownloadStore.list(this);
+        downloadEmpty.setVisibility(items.isEmpty() ? View.VISIBLE : View.GONE);
+        for (DownloadItem item : items) {
+            downloadList.addView(createDownloadRow(item));
+        }
+    }
+
+    private LinearLayout createDownloadRow(DownloadItem item) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(8), dp(8), dp(8), dp(8));
+        row.setBackgroundColor(Color.WHITE);
+
+        ImageView thumb = new ImageView(this);
+        thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        thumb.setBackgroundColor(Color.rgb(226, 232, 240));
+        imageLoader.load(item.thumbnailUrl, thumb);
+        row.addView(thumb, new LinearLayout.LayoutParams(dp(120), dp(68)));
+
+        LinearLayout textCol = new LinearLayout(this);
+        textCol.setOrientation(LinearLayout.VERTICAL);
+        textCol.setPadding(dp(12), 0, dp(4), 0);
+
+        TextView title = new TextView(this);
+        title.setText(item.title);
+        title.setTextColor(Color.rgb(15, 23, 42));
+        title.setTextSize(15);
+        title.setMaxLines(2);
+        textCol.addView(title);
+
+        TextView sub = new TextView(this);
+        String subText = item.uploader;
+        if (!item.quality.isEmpty()) subText = subText.isEmpty() ? item.quality : item.uploader + " · " + item.quality;
+        sub.setText(subText + " · 오프라인");
+        sub.setTextColor(Color.rgb(100, 116, 139));
+        sub.setTextSize(12);
+        sub.setMaxLines(1);
+        textCol.addView(sub);
+
+        row.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1));
+
+        Button delete = new Button(this);
+        delete.setText("삭제");
+        delete.setAllCaps(false);
+        delete.setTextSize(12);
+        delete.setOnClickListener(v -> confirmDelete(item));
+        row.addView(delete, new LinearLayout.LayoutParams(-2, dp(40)));
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, 0, 0, dp(8));
+        row.setLayoutParams(params);
+        row.setOnClickListener(v -> playOffline(item));
+        return row;
+    }
+
+    private void confirmDelete(DownloadItem item) {
+        new AlertDialog.Builder(this)
+                .setTitle("삭제")
+                .setMessage("이 영상을 삭제할까요? 저장된 파일도 함께 삭제됩니다.")
+                .setPositiveButton("삭제", (d, w) -> {
+                    DownloadItem removed = DownloadStore.remove(this, item.id);
+                    if (removed != null) MediaDownloader.deleteFile(this, removed.uri);
+                    refreshDownloadList();
+                    Toast.makeText(this, "삭제되었습니다.", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("취소", null)
+                .show();
+    }
+
+    private void playOffline(DownloadItem item) {
+        currentItem = null;
+        offlinePlaying = true;
+        showScreen(SCREEN_SEARCH);
+        showPlayingLayout(true);
+        downloadButton.setVisibility(View.GONE);
+        metaView.setText(item.title + (item.uploader.isEmpty() ? "" : "\n\n" + item.uploader) + "\n\n오프라인 재생");
+        player.setMediaItem(buildMediaItem(item.uri));
+        player.prepare();
+        player.play();
+    }
+
+    // ---- Settings screen ---------------------------------------------------
+
+    private LinearLayout buildSettingsScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setVisibility(View.GONE);
+        screen.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+
+        TextView title = new TextView(this);
+        title.setText("설정");
+        title.setTextColor(Color.rgb(15, 23, 42));
+        title.setTextSize(20);
+        title.setPadding(dp(16), dp(14), dp(16), dp(10));
+        screen.addView(title);
+
+        TextView label = new TextView(this);
+        label.setText("다운로드 저장 폴더");
+        label.setTextColor(Color.rgb(15, 23, 42));
+        label.setTextSize(15);
+        label.setPadding(dp(16), dp(8), dp(16), dp(4));
+        screen.addView(label);
+
+        folderText = new TextView(this);
+        folderText.setTextColor(Color.rgb(71, 85, 105));
+        folderText.setTextSize(13);
+        folderText.setPadding(dp(16), 0, dp(16), dp(8));
+        screen.addView(folderText);
+
+        Button change = new Button(this);
+        change.setText("폴더 변경");
+        change.setAllCaps(false);
+        change.setOnClickListener(v -> pickFolder());
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-2, dp(46));
+        cp.setMargins(dp(16), dp(4), dp(16), dp(8));
+        screen.addView(change, cp);
+
+        Button reset = new Button(this);
+        reset.setText("기본 폴더로 되돌리기");
+        reset.setAllCaps(false);
+        reset.setOnClickListener(v -> {
+            DownloadStore.setFolderUri(this, "");
+            refreshSettings();
+            Toast.makeText(this, "기본 폴더로 설정했습니다.", Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-2, dp(46));
+        rp.setMargins(dp(16), 0, dp(16), dp(8));
+        screen.addView(reset, rp);
+
+        return screen;
+    }
+
+    private void refreshSettings() {
+        String folder = DownloadStore.getFolderUri(this);
+        if (folder == null || folder.isEmpty()) {
+            File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+            folderText.setText("앱 기본 폴더\n" + (dir == null ? "" : dir.getAbsolutePath()));
+        } else {
+            folderText.setText(Uri.decode(folder));
+        }
+    }
+
+    private void pickFolder() {
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            startActivityForResult(intent, REQUEST_FOLDER);
+        } catch (Exception e) {
+            Toast.makeText(this, "폴더 선택을 열 수 없습니다.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_FOLDER && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri uri = data.getData();
+            try {
+                getContentResolver().takePersistableUriPermission(uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            } catch (Exception ignored) {
+                // some providers don't support persistable permissions
+            }
+            DownloadStore.setFolderUri(this, uri.toString());
+            refreshSettings();
+            Toast.makeText(this, "저장 폴더가 설정되었습니다.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ---- Bottom navigation -------------------------------------------------
+
+    private void addNavButton(String label, int screen) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setTextSize(13);
+        button.setAllCaps(false);
+        button.setOnClickListener(v -> onNavClicked(screen));
+        navButtons.add(button);
+        bottomNav.addView(button, new LinearLayout.LayoutParams(0, -1, 1));
+    }
+
+    private void onNavClicked(int screen) {
+        if (screen == SCREEN_SEARCH && currentScreen == SCREEN_SEARCH) {
+            // Re-tapping 유튜브 returns to the main list.
+            closePlayer();
+        }
+        if (screen != SCREEN_SEARCH && playing) {
+            player.pause();
+        }
+        showScreen(screen);
+    }
+
+    private void showScreen(int screen) {
+        currentScreen = screen;
+        searchScreen.setVisibility(screen == SCREEN_SEARCH ? View.VISIBLE : View.GONE);
+        downloadScreen.setVisibility(screen == SCREEN_DOWNLOADS ? View.VISIBLE : View.GONE);
+        settingsScreen.setVisibility(screen == SCREEN_SETTINGS ? View.VISIBLE : View.GONE);
+        for (int i = 0; i < navButtons.size(); i++) {
+            boolean selected = i == screen;
+            Button button = navButtons.get(i);
             button.setTextColor(selected ? Color.WHITE : Color.rgb(203, 213, 225));
             button.setBackgroundColor(selected ? Color.rgb(229, 57, 53) : Color.rgb(11, 15, 20));
         }
-        refreshSortButtons();
-        runSearch();
+        if (screen == SCREEN_DOWNLOADS) refreshDownloadList();
+        if (screen == SCREEN_SETTINGS) refreshSettings();
     }
+
+    // ---- Search ------------------------------------------------------------
 
     private void runSearch() {
         final int token = ++searchToken;
@@ -258,16 +531,15 @@ public final class MainActivity extends Activity {
         resultsList.removeAllViews();
         statusView.setText("불러오는 중...");
         loadingMore = true;
-        session = ExtractorBridge.newSearch(query, currentTab, currentSort);
+        session = ExtractorBridge.newSearch(query, Tab.YOUTUBE, currentSort);
         final ExtractorBridge.SearchSession active = session;
         executor.execute(() -> {
             try {
-                // Pull a couple of pages up front for a fuller first screen.
                 List<TubeItem> batch = new ArrayList<>(active.loadMore());
                 if (batch.size() < 25 && active.hasMore()) batch.addAll(active.loadMore());
                 mainHandler.post(() -> {
                     if (token != searchToken) return;
-                    onBatchLoaded(batch, true);
+                    onBatchLoaded(batch);
                 });
             } catch (Exception e) {
                 mainHandler.post(() -> {
@@ -290,7 +562,7 @@ public final class MainActivity extends Activity {
                 List<TubeItem> batch = new ArrayList<>(active.loadMore());
                 mainHandler.post(() -> {
                     if (token != searchToken) return;
-                    onBatchLoaded(batch, false);
+                    onBatchLoaded(batch);
                 });
             } catch (Exception e) {
                 mainHandler.post(() -> {
@@ -300,11 +572,9 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void onBatchLoaded(List<TubeItem> batch, boolean initial) {
+    private void onBatchLoaded(List<TubeItem> batch) {
         results.addAll(batch);
-        for (TubeItem item : batch) {
-            resultsList.addView(createResultRow(item));
-        }
+        for (TubeItem item : batch) resultsList.addView(createResultRow(item));
         if (results.isEmpty()) {
             statusView.setText("결과가 없습니다.");
         } else {
@@ -352,7 +622,7 @@ public final class MainActivity extends Activity {
         row.setLayoutParams(params);
         row.setOnClickListener(v -> {
             if (!item.playable) {
-                Toast.makeText(this, "채널 상세 화면은 다음 단계에서 붙일 예정입니다.", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "채널은 재생할 수 없습니다.", Toast.LENGTH_SHORT).show();
                 return;
             }
             play(item);
@@ -360,11 +630,14 @@ public final class MainActivity extends Activity {
         return row;
     }
 
+    // ---- Playback ----------------------------------------------------------
+
     private void play(TubeItem item) {
+        currentItem = item;
+        offlinePlaying = false;
         playing = true;
-        playerView.setVisibility(View.VISIBLE);
-        playerBar.setVisibility(View.VISIBLE);
-        metaScroll.setVisibility(View.VISIBLE);
+        showPlayingLayout(true);
+        downloadButton.setVisibility(View.VISIBLE);
         metaView.setText("재생 준비 중: " + item.title);
         executor.execute(() -> {
             try {
@@ -381,9 +654,6 @@ public final class MainActivity extends Activity {
 
     private void startPlayer(PlaybackData data) {
         playing = true;
-        playerView.setVisibility(View.VISIBLE);
-        playerBar.setVisibility(View.VISIBLE);
-        metaScroll.setVisibility(View.VISIBLE);
         metaView.setText(buildMeta(data));
         metaScroll.scrollTo(0, 0);
         player.setMediaItem(buildMediaItem(data.mediaUrl));
@@ -391,12 +661,21 @@ public final class MainActivity extends Activity {
         player.play();
     }
 
+    // Shows only the player + description (hides the search bar and result list).
+    private void showPlayingLayout(boolean show) {
+        searchRow.setVisibility(show ? View.GONE : View.VISIBLE);
+        sortRow.setVisibility(show ? View.GONE : View.VISIBLE);
+        statusView.setVisibility(show ? View.GONE : View.VISIBLE);
+        resultsScroll.setVisibility(show ? View.GONE : View.VISIBLE);
+        playerView.setVisibility(show ? View.VISIBLE : View.GONE);
+        playerBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        metaScroll.setVisibility(show ? View.VISIBLE : View.GONE);
+    }
+
     private CharSequence buildMeta(PlaybackData data) {
         StringBuilder sb = new StringBuilder();
         sb.append(data.title == null ? "" : data.title).append("\n\n");
-        if (data.uploader != null && !data.uploader.isEmpty()) {
-            sb.append(data.uploader).append("\n");
-        }
+        if (data.uploader != null && !data.uploader.isEmpty()) sb.append(data.uploader).append("\n");
         List<String> line = new ArrayList<>();
         if (data.viewCount >= 0) line.add("조회수 " + ExtractorBridge.formatCount(data.viewCount) + "회");
         if (!data.uploadDate.isEmpty()) line.add(data.uploadDate);
@@ -413,15 +692,13 @@ public final class MainActivity extends Activity {
 
     private void closePlayer() {
         playing = false;
+        offlinePlaying = false;
+        currentItem = null;
         player.pause();
         player.clearMediaItems();
-        playerView.setVisibility(View.GONE);
-        playerBar.setVisibility(View.GONE);
-        metaScroll.setVisibility(View.GONE);
+        showPlayingLayout(false);
     }
 
-    // Opens a resolution picker for the current stream. Adaptive HLS/DASH streams
-    // expose several qualities here; "자동(Auto)" lets ExoPlayer choose.
     private void showQualityDialog() {
         if (!playing) return;
         try {
@@ -434,13 +711,66 @@ public final class MainActivity extends Activity {
         }
     }
 
+    // ---- Download ----------------------------------------------------------
+
+    private void onDownloadClicked() {
+        if (currentItem == null) {
+            Toast.makeText(this, "다운로드할 영상이 없습니다.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final TubeItem item = currentItem;
+        Toast.makeText(this, "화질 정보를 불러오는 중...", Toast.LENGTH_SHORT).show();
+        executor.execute(() -> {
+            try {
+                List<ExtractorBridge.DownloadOption> options = ExtractorBridge.downloadOptions(item.url);
+                mainHandler.post(() -> showDownloadDialog(item, options));
+            } catch (Exception e) {
+                mainHandler.post(() ->
+                        Toast.makeText(this, "화질 정보를 불러오지 못했습니다.", Toast.LENGTH_SHORT).show());
+            }
+        });
+    }
+
+    private void showDownloadDialog(TubeItem item, List<ExtractorBridge.DownloadOption> options) {
+        if (options.isEmpty()) {
+            Toast.makeText(this, "다운로드 가능한 화질이 없습니다.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        String[] labels = new String[options.size()];
+        for (int i = 0; i < options.size(); i++) labels[i] = options.get(i).label;
+        new AlertDialog.Builder(this)
+                .setTitle("다운로드 화질 선택")
+                .setItems(labels, (d, which) -> startDownload(item, options.get(which)))
+                .show();
+    }
+
+    private void startDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
+        Toast.makeText(this, "다운로드를 시작합니다...", Toast.LENGTH_SHORT).show();
+        executor.execute(() -> {
+            try {
+                String fileName = MediaDownloader.safeFileName(item.title, option.ext);
+                String savedUri = MediaDownloader.download(this, option.url, fileName, option.mime);
+                String id = ExtractorBridge.videoIdOf(item.url);
+                if (id.isEmpty()) id = fileName;
+                DownloadStore.add(this, new DownloadItem(
+                        id, item.title, item.subtitle, savedUri, item.thumbnailUrl, option.label));
+                mainHandler.post(() ->
+                        Toast.makeText(this, "다운로드 완료: " + item.title, Toast.LENGTH_LONG).show());
+            } catch (Exception e) {
+                mainHandler.post(() ->
+                        Toast.makeText(this, "다운로드 실패: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    // ---- Fullscreen / popup ------------------------------------------------
+
     private void enterPopup() {
         if (!playing || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         try {
-            PictureInPictureParams params = new PictureInPictureParams.Builder()
+            enterPictureInPictureMode(new PictureInPictureParams.Builder()
                     .setAspectRatio(new Rational(16, 9))
-                    .build();
-            enterPictureInPictureMode(params);
+                    .build());
         } catch (Exception e) {
             Toast.makeText(this, "팝업 재생을 시작할 수 없습니다.", Toast.LENGTH_SHORT).show();
         }
@@ -448,7 +778,6 @@ public final class MainActivity extends Activity {
 
     @Override
     public void onUserLeaveHint() {
-        // Auto-enter popup when leaving the app mid-playback.
         if (playing && !fullscreen && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             enterPopup();
         }
@@ -462,16 +791,10 @@ public final class MainActivity extends Activity {
     }
 
     private void applyPipLayout(boolean pip) {
-        int chrome = pip ? View.GONE : View.VISIBLE;
-        searchRow.setVisibility(chrome);
-        sortRow.setVisibility(chrome);
-        statusView.setVisibility(chrome);
-        scrollView.setVisibility(chrome);
-        tabsBar.setVisibility(chrome);
+        bottomNav.setVisibility(pip ? View.GONE : View.VISIBLE);
         playerBar.setVisibility(pip ? View.GONE : (playing ? View.VISIBLE : View.GONE));
         metaScroll.setVisibility(pip ? View.GONE : (playing ? View.VISIBLE : View.GONE));
         playerView.setUseController(!pip);
-
         LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) playerView.getLayoutParams();
         lp.height = pip ? LinearLayout.LayoutParams.MATCH_PARENT : dp(220);
         playerView.setLayoutParams(lp);
@@ -482,20 +805,12 @@ public final class MainActivity extends Activity {
         setRequestedOrientation(enter
                 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 : ActivityInfo.SCREEN_ORIENTATION_USER);
-
-        int chrome = enter ? View.GONE : View.VISIBLE;
-        searchRow.setVisibility(chrome);
-        sortRow.setVisibility(chrome);
-        statusView.setVisibility(chrome);
-        scrollView.setVisibility(chrome);
-        tabsBar.setVisibility(chrome);
+        bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
         playerBar.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
         metaScroll.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
-
         LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) playerView.getLayoutParams();
         lp.height = enter ? LinearLayout.LayoutParams.MATCH_PARENT : dp(220);
         playerView.setLayoutParams(lp);
-
         applyImmersive(enter);
     }
 
@@ -517,6 +832,10 @@ public final class MainActivity extends Activity {
             setFullscreen(false);
             return;
         }
+        if (currentScreen != SCREEN_SEARCH) {
+            showScreen(SCREEN_SEARCH);
+            return;
+        }
         if (playing) {
             closePlayer();
             return;
@@ -524,8 +843,6 @@ public final class MainActivity extends Activity {
         super.onBackPressed();
     }
 
-    // Manifest URLs from YouTube often lack a file extension, so ExoPlayer can't
-    // infer HLS/DASH from the URI alone — set the MIME type explicitly.
     private MediaItem buildMediaItem(String mediaUrl) {
         MediaItem.Builder builder = new MediaItem.Builder().setUri(mediaUrl);
         String lower = mediaUrl.toLowerCase();

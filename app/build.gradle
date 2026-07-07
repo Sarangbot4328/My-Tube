@@ -26,6 +26,7 @@ dependencies {
     implementation "androidx.media3:media3-exoplayer-dash:1.4.1"
     implementation "androidx.media3:media3-exoplayer-hls:1.4.1"
     implementation "androidx.media3:media3-ui:1.4.1"
+    implementation "androidx.documentfile:documentfile:1.0.1"
     implementation "com.github.teamnewpipe:NewPipeExtractor:v0.26.3"
     coreLibraryDesugaring "com.android.tools:desugar_jdk_libs_nio:2.1.4"
 }

@@ -59,7 +59,6 @@ final class ExtractorBridge {
     enum SortOrder {
         RELEVANCE("CAASAhAB"),
         DATE("CAISAhAB"),
-        VIEWS("CAMSAhAB"),
         RATING("CAESAhAB");
         final String videoParams;
         SortOrder(String videoParams) { this.videoParams = videoParams; }
@@ -201,6 +200,7 @@ final class ExtractorBridge {
                     + "}";
             String response = httpPost(itUrl, payload, itHeaders);
             List<TubeItem> items = parseRendererBlocks(response, tab, actualQuery);
+            sortItems(items);
             continuationToken = extractContinuationToken(response);
             return items;
         }
@@ -224,6 +224,7 @@ final class ExtractorBridge {
                 return new ArrayList<>();
             }
             List<TubeItem> items = parseRendererBlocks(response, tab, actualQuery);
+            sortItems(items);
             continuationToken = extractContinuationToken(response);
             return items;
         }
@@ -234,7 +235,15 @@ final class ExtractorBridge {
                 html = httpGet("https://www.youtube.com/results?search_query="
                         + URLEncoder.encode(actualQuery, StandardCharsets.UTF_8.name()));
             }
-            return scrapeResultsHtml(html, tab, actualQuery);
+            List<TubeItem> items = scrapeResultsHtml(html, tab, actualQuery);
+            sortItems(items);
+            return items;
+        }
+
+        private void sortItems(List<TubeItem> items) {
+            if (sort == SortOrder.DATE) {
+                items.sort(Comparator.comparingLong(item -> item.publishedAgeSeconds));
+            }
         }
     }
 
@@ -784,15 +793,17 @@ final class ExtractorBridge {
             String title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
             String channel = clean(match(block, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
             String length = clean(match(block, "\"lengthText\":\\{\"simpleText\":\"(.*?)\""));
+            String published = clean(match(block, "\"publishedTimeText\":\\{\"simpleText\":\"(.*?)\""));
             if (id.isEmpty() || title.isEmpty()) continue;
             if (tab == MainActivity.Tab.SHORTS && !query.toLowerCase().contains("short")) continue;
             items.add(new TubeItem(
                     title,
-                    (channel.isEmpty() ? "YouTube" : channel) + (length.isEmpty() ? "" : " · " + length),
+                    subtitle(channel, length, published),
                     "https://www.youtube.com/watch?v=" + id,
                     youtubeThumbnail(id),
                     true,
-                    tab == MainActivity.Tab.SHORTS
+                    tab == MainActivity.Tab.SHORTS,
+                    parseRelativeAgeSeconds(published)
             ));
             if (items.size() >= MAX_RESULTS) break;
         }
@@ -831,21 +842,58 @@ final class ExtractorBridge {
             String channel = clean(match(block, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
             if (channel.isEmpty()) channel = clean(match(block, "\"shortBylineText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
             String length = clean(match(block, "\"lengthText\":\\{\"simpleText\":\"(.*?)\""));
+            String published = clean(match(block, "\"publishedTimeText\":\\{\"simpleText\":\"(.*?)\""));
             if (id.isEmpty() || title.isEmpty()) continue;
             boolean shortForm = tab == MainActivity.Tab.SHORTS || block.contains("\"navigationEndpoint\":{\"commandMetadata\":{\"webCommandMetadata\":{\"url\":\"/shorts/");
             if (tab == MainActivity.Tab.SHORTS && !shortForm && !query.toLowerCase().contains("short")) continue;
             if (tab == MainActivity.Tab.VIDEOS && shortForm) continue;
             items.add(new TubeItem(
                     title,
-                    (channel.isEmpty() ? "YouTube" : channel) + (length.isEmpty() ? "" : " · " + length),
+                    subtitle(channel, length, published),
                     "https://www.youtube.com/watch?v=" + id,
                     youtubeThumbnail(id),
                     true,
-                    shortForm
+                    shortForm,
+                    parseRelativeAgeSeconds(published)
             ));
             if (items.size() >= MAX_RESULTS) break;
         }
         return items;
+    }
+
+    private static String subtitle(String channel, String length, String published) {
+        List<String> parts = new ArrayList<>();
+        parts.add(channel.isEmpty() ? "YouTube" : channel);
+        if (!length.isEmpty()) parts.add(length);
+        if (!published.isEmpty()) parts.add(published);
+        return String.join(" · ", parts);
+    }
+
+    private static long parseRelativeAgeSeconds(String text) {
+        if (text == null || text.trim().isEmpty()) return Long.MAX_VALUE;
+        String value = text.trim().toLowerCase();
+        if (value.contains("방금") || value.contains("실시간") || value.contains("live")
+                || value.contains("streamed")) {
+            return 0;
+        }
+        if (value.contains("어제") || value.contains("yesterday")) return 24L * 60L * 60L;
+
+        Matcher matcher = Pattern.compile("(\\d+)\\s*([가-힣a-z]+)").matcher(value);
+        if (!matcher.find()) return Long.MAX_VALUE;
+        long amount = parseLong(matcher.group(1));
+        String unit = matcher.group(2);
+        if (unit.startsWith("초") || unit.startsWith("sec")) return amount;
+        if (unit.startsWith("분") || unit.startsWith("min")) return amount * 60L;
+        if (unit.startsWith("시간") || unit.startsWith("hour")) return amount * 60L * 60L;
+        if (unit.startsWith("일") || unit.startsWith("day")) return amount * 24L * 60L * 60L;
+        if (unit.startsWith("주") || unit.startsWith("week")) return amount * 7L * 24L * 60L * 60L;
+        if (unit.startsWith("개월") || unit.startsWith("달") || unit.startsWith("month")) {
+            return amount * 30L * 24L * 60L * 60L;
+        }
+        if (unit.startsWith("년") || unit.startsWith("year")) {
+            return amount * 365L * 24L * 60L * 60L;
+        }
+        return Long.MAX_VALUE;
     }
 
     private static String httpGet(String url) throws Exception {

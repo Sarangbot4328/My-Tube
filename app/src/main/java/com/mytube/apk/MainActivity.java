@@ -13,6 +13,8 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.util.Rational;
 import android.view.Gravity;
 import android.view.View;
@@ -33,6 +35,7 @@ import androidx.media3.common.Player;
 import androidx.media3.common.Tracks;
 import androidx.media3.common.VideoSize;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.ui.AspectRatioFrameLayout;
 import androidx.media3.ui.PlayerView;
 import androidx.media3.ui.TrackSelectionDialogBuilder;
 
@@ -62,7 +65,6 @@ public final class MainActivity extends Activity {
     private static final SortOption[] SORTS = {
             new SortOption("관련성", ExtractorBridge.SortOrder.RELEVANCE),
             new SortOption("최신", ExtractorBridge.SortOrder.DATE),
-            new SortOption("조회수", ExtractorBridge.SortOrder.VIEWS),
             new SortOption("평점", ExtractorBridge.SortOrder.RATING),
     };
 
@@ -100,11 +102,13 @@ public final class MainActivity extends Activity {
     // Downloads / settings views.
     private LinearLayout downloadList;
     private TextView downloadEmpty;
+    private EditText downloadSearchInput;
     private TextView folderText;
 
     private ExtractorBridge.SortOrder currentSort = ExtractorBridge.SortOrder.RELEVANCE;
     private ExtractorBridge.SearchSession session;
     private TubeItem currentItem;
+    private PlaybackData currentPlaybackData;
 
     private boolean fullscreen;
     private boolean playing;
@@ -224,6 +228,8 @@ public final class MainActivity extends Activity {
 
         playerView = new PlayerView(this);
         playerView.setPlayer(player);
+        playerView.setBackgroundColor(Color.BLACK);
+        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
         playerView.setVisibility(View.GONE);
         playerView.setFullscreenButtonClickListener(this::setFullscreen);
         screen.addView(playerView, new LinearLayout.LayoutParams(-1, dp(220)));
@@ -248,7 +254,7 @@ public final class MainActivity extends Activity {
         metaView.setPadding(dp(16), dp(10), dp(16), dp(10));
         metaView.setTextIsSelectable(true);
         metaScroll.addView(metaView);
-        screen.addView(metaScroll, new LinearLayout.LayoutParams(-1, dp(150)));
+        screen.addView(metaScroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
         statusView = new TextView(this);
         statusView.setTextColor(Color.rgb(71, 85, 105));
@@ -327,6 +333,45 @@ public final class MainActivity extends Activity {
         title.setPadding(dp(16), dp(14), dp(16), dp(10));
         screen.addView(title);
 
+        LinearLayout downloadSearchRow = new LinearLayout(this);
+        downloadSearchRow.setOrientation(LinearLayout.HORIZONTAL);
+        downloadSearchRow.setPadding(dp(12), 0, dp(12), dp(8));
+
+        downloadSearchInput = new EditText(this);
+        downloadSearchInput.setSingleLine(true);
+        downloadSearchInput.setHint("다운로드 검색");
+        downloadSearchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        downloadSearchInput.setTextColor(Color.rgb(15, 23, 42));
+        downloadSearchInput.setHintTextColor(Color.rgb(100, 116, 139));
+        downloadSearchInput.setBackgroundColor(Color.WHITE);
+        downloadSearchInput.setPadding(dp(12), 0, dp(12), 0);
+        downloadSearchInput.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                refreshDownloadList();
+                return true;
+            }
+            return false;
+        });
+        downloadSearchInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                refreshDownloadList();
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {}
+        });
+        downloadSearchRow.addView(downloadSearchInput, new LinearLayout.LayoutParams(0, dp(46), 1));
+
+        Button downloadSearchButton = new Button(this);
+        downloadSearchButton.setText("검색");
+        downloadSearchButton.setOnClickListener(v -> refreshDownloadList());
+        downloadSearchRow.addView(downloadSearchButton, new LinearLayout.LayoutParams(dp(78), dp(46)));
+        screen.addView(downloadSearchRow);
+
         downloadEmpty = new TextView(this);
         downloadEmpty.setText("다운로드한 영상이 없습니다.");
         downloadEmpty.setTextColor(Color.rgb(100, 116, 139));
@@ -346,10 +391,23 @@ public final class MainActivity extends Activity {
     private void refreshDownloadList() {
         downloadList.removeAllViews();
         List<DownloadItem> items = DownloadStore.list(this);
-        downloadEmpty.setVisibility(items.isEmpty() ? View.VISIBLE : View.GONE);
+        String query = downloadSearchInput == null ? "" : downloadSearchInput.getText().toString().trim();
+        int shown = 0;
         for (DownloadItem item : items) {
+            if (!matchesDownloadQuery(item, query)) continue;
             downloadList.addView(createDownloadRow(item));
+            shown++;
         }
+        downloadEmpty.setText(items.isEmpty() ? "다운로드한 영상이 없습니다." : "검색 결과가 없습니다.");
+        downloadEmpty.setVisibility(shown == 0 ? View.VISIBLE : View.GONE);
+    }
+
+    private boolean matchesDownloadQuery(DownloadItem item, String query) {
+        if (query == null || query.isEmpty()) return true;
+        String needle = query.toLowerCase();
+        String haystack = (item.title + "\n" + item.uploader + "\n"
+                + item.quality + "\n" + item.searchText).toLowerCase();
+        return haystack.contains(needle);
     }
 
     private LinearLayout createDownloadRow(DownloadItem item) {
@@ -417,7 +475,9 @@ public final class MainActivity extends Activity {
 
     private void playOffline(DownloadItem item) {
         currentItem = null;
+        currentPlaybackData = null;
         offlinePlaying = true;
+        playing = true;
         showScreen(SCREEN_SEARCH);
         showPlayingLayout(true);
         downloadButton.setVisibility(View.GONE);
@@ -667,6 +727,7 @@ public final class MainActivity extends Activity {
 
     private void play(TubeItem item) {
         currentItem = item;
+        currentPlaybackData = null;
         offlinePlaying = false;
         playing = true;
         showPlayingLayout(true);
@@ -687,6 +748,7 @@ public final class MainActivity extends Activity {
 
     private void startPlayer(PlaybackData data) {
         playing = true;
+        currentPlaybackData = data;
         metaView.setText(buildMeta(data));
         metaScroll.scrollTo(0, 0);
         player.setMediaItem(buildMediaItem(data.mediaUrl));
@@ -727,6 +789,7 @@ public final class MainActivity extends Activity {
         playing = false;
         offlinePlaying = false;
         currentItem = null;
+        currentPlaybackData = null;
         player.pause();
         player.clearMediaItems();
         qualityButton.setText("화질");
@@ -782,6 +845,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
+        final PlaybackData downloadMetadata = currentPlaybackData;
         showDownloadStatus("다운로드 준비 중: " + item.title);
         executor.execute(() -> {
             try {
@@ -791,7 +855,8 @@ public final class MainActivity extends Activity {
                 String id = ExtractorBridge.videoIdOf(item.url);
                 if (id.isEmpty()) id = MediaDownloader.safeFileName(item.title, option.ext);
                 DownloadStore.add(this, new DownloadItem(
-                        id, item.title, item.subtitle, savedUri, item.thumbnailUrl, option.label));
+                        id, item.title, item.subtitle, savedUri, item.thumbnailUrl, option.label,
+                        buildDownloadSearchText(item, downloadMetadata)));
                 mainHandler.post(() -> {
                     showDownloadStatus("✓ 다운로드 완료: " + item.title);
                     if (currentScreen == SCREEN_DOWNLOADS) refreshDownloadList();
@@ -802,6 +867,19 @@ public final class MainActivity extends Activity {
                 mainHandler.post(() -> showDownloadStatus("✗ 다운로드 실패: " + message));
             }
         });
+    }
+
+    private String buildDownloadSearchText(TubeItem item, PlaybackData data) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(item.title).append('\n').append(item.subtitle);
+        if (data != null) {
+            if (data.uploader != null) sb.append('\n').append(data.uploader);
+            if (data.description != null) sb.append('\n').append(data.description);
+            if (data.tags != null && !data.tags.isEmpty()) {
+                for (String tag : data.tags) sb.append('\n').append(tag);
+            }
+        }
+        return sb.toString();
     }
 
     private void showDownloadStatus(String text) {

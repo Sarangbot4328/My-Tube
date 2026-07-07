@@ -35,7 +35,8 @@ final class DownloadStore {
                         o.optString("uploader"),
                         o.optString("uri"),
                         o.optString("thumbnailUrl"),
-                        o.optString("quality")
+                        o.optString("quality"),
+                        o.optString("searchText")
                 ));
             }
         } catch (Exception ignored) {
@@ -90,6 +91,7 @@ final class DownloadStore {
                 o.put("uri", item.uri);
                 o.put("thumbnailUrl", item.thumbnailUrl);
                 o.put("quality", item.quality);
+                o.put("searchText", item.searchText);
                 array.put(o);
             } catch (Exception ignored) {
                 // skip malformed entry

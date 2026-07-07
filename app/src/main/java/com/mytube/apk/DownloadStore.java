@@ -15,6 +15,9 @@ final class DownloadStore {
     private static final String PREFS = "mytube_downloads";
     private static final String KEY_ITEMS = "items";
     private static final String KEY_FOLDER_URI = "folder_uri";
+    private static final String KEY_NEXT_PLAY_ORDER = "next_play_order";
+    static final String ORDER_SEQUENTIAL = "sequential";
+    static final String ORDER_RANDOM = "random";
 
     private DownloadStore() {}
 
@@ -106,5 +109,17 @@ final class DownloadStore {
 
     static void setFolderUri(Context c, String uri) {
         prefs(c).edit().putString(KEY_FOLDER_URI, uri == null ? "" : uri).apply();
+    }
+
+    static String getNextPlayOrder(Context c) {
+        String order = prefs(c).getString(KEY_NEXT_PLAY_ORDER, ORDER_SEQUENTIAL);
+        return ORDER_RANDOM.equals(order) ? ORDER_RANDOM : ORDER_SEQUENTIAL;
+    }
+
+    static void setNextPlayOrder(Context c, String order) {
+        prefs(c).edit()
+                .putString(KEY_NEXT_PLAY_ORDER,
+                        ORDER_RANDOM.equals(order) ? ORDER_RANDOM : ORDER_SEQUENTIAL)
+                .apply();
     }
 }

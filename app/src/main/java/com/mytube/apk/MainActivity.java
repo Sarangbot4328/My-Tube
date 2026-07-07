@@ -41,7 +41,10 @@ import androidx.media3.ui.TrackSelectionDialogBuilder;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -104,16 +107,22 @@ public final class MainActivity extends Activity {
     private TextView downloadEmpty;
     private EditText downloadSearchInput;
     private TextView folderText;
+    private TextView nextPlayOrderText;
+    private Button sequentialOrderButton;
+    private Button randomOrderButton;
 
     private ExtractorBridge.SortOrder currentSort = ExtractorBridge.SortOrder.RELEVANCE;
     private ExtractorBridge.SearchSession session;
     private TubeItem currentItem;
     private PlaybackData currentPlaybackData;
+    private final Random random = new Random();
+    private final Set<String> autoplayPlayedKeys = new HashSet<>();
 
     private boolean fullscreen;
     private boolean playing;
     private boolean offlinePlaying;
     private boolean loadingMore;
+    private boolean preparingAutoplay;
     private int searchToken;
 
     @Override
@@ -132,6 +141,13 @@ public final class MainActivity extends Activity {
             @Override
             public void onTracksChanged(Tracks tracks) {
                 updateQualityLabel();
+            }
+
+            @Override
+            public void onPlaybackStateChanged(int playbackState) {
+                if (playbackState == Player.STATE_ENDED) {
+                    maybeAutoPlayNext();
+                }
             }
         });
         showScreen(SCREEN_SEARCH);
@@ -477,6 +493,8 @@ public final class MainActivity extends Activity {
     private void playOffline(DownloadItem item) {
         currentItem = null;
         currentPlaybackData = null;
+        autoplayPlayedKeys.clear();
+        preparingAutoplay = false;
         offlinePlaying = true;
         playing = true;
         showScreen(SCREEN_SEARCH);
@@ -502,6 +520,45 @@ public final class MainActivity extends Activity {
         title.setTextSize(20);
         title.setPadding(dp(16), dp(14), dp(16), dp(10));
         screen.addView(title);
+
+        TextView version = new TextView(this);
+        version.setText("버전 My Tube 1.1");
+        version.setTextColor(Color.rgb(71, 85, 105));
+        version.setTextSize(14);
+        version.setPadding(dp(16), 0, dp(16), dp(14));
+        screen.addView(version);
+
+        TextView playOrderLabel = new TextView(this);
+        playOrderLabel.setText("다음 영상 재생 순서");
+        playOrderLabel.setTextColor(Color.rgb(15, 23, 42));
+        playOrderLabel.setTextSize(15);
+        playOrderLabel.setPadding(dp(16), dp(6), dp(16), dp(4));
+        screen.addView(playOrderLabel);
+
+        nextPlayOrderText = new TextView(this);
+        nextPlayOrderText.setTextColor(Color.rgb(71, 85, 105));
+        nextPlayOrderText.setTextSize(13);
+        nextPlayOrderText.setPadding(dp(16), 0, dp(16), dp(8));
+        screen.addView(nextPlayOrderText);
+
+        LinearLayout playOrderRow = new LinearLayout(this);
+        playOrderRow.setOrientation(LinearLayout.HORIZONTAL);
+        playOrderRow.setPadding(dp(12), 0, dp(12), dp(12));
+
+        sequentialOrderButton = new Button(this);
+        sequentialOrderButton.setText("순차재생");
+        sequentialOrderButton.setAllCaps(false);
+        sequentialOrderButton.setOnClickListener(v -> setNextPlayOrder(DownloadStore.ORDER_SEQUENTIAL));
+        playOrderRow.addView(sequentialOrderButton, new LinearLayout.LayoutParams(0, dp(46), 1));
+
+        randomOrderButton = new Button(this);
+        randomOrderButton.setText("랜덤재생");
+        randomOrderButton.setAllCaps(false);
+        randomOrderButton.setOnClickListener(v -> setNextPlayOrder(DownloadStore.ORDER_RANDOM));
+        LinearLayout.LayoutParams randomLp = new LinearLayout.LayoutParams(0, dp(46), 1);
+        randomLp.setMargins(dp(8), 0, 0, 0);
+        playOrderRow.addView(randomOrderButton, randomLp);
+        screen.addView(playOrderRow);
 
         TextView label = new TextView(this);
         label.setText("다운로드 저장 폴더");
@@ -547,6 +604,31 @@ public final class MainActivity extends Activity {
         } else {
             folderText.setText(Uri.decode(folder));
         }
+        refreshNextPlayOrderUi();
+    }
+
+    private void setNextPlayOrder(String order) {
+        DownloadStore.setNextPlayOrder(this, order);
+        refreshNextPlayOrderUi();
+        Toast.makeText(this,
+                DownloadStore.ORDER_RANDOM.equals(order) ? "랜덤재생으로 설정했습니다." : "순차재생으로 설정했습니다.",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private void refreshNextPlayOrderUi() {
+        if (nextPlayOrderText == null || sequentialOrderButton == null || randomOrderButton == null) return;
+        String order = DownloadStore.getNextPlayOrder(this);
+        boolean randomOrder = DownloadStore.ORDER_RANDOM.equals(order);
+        nextPlayOrderText.setText(randomOrder
+                ? "검색 결과 안에서 이미 재생한 영상을 제외하고 랜덤으로 재생합니다."
+                : "현재 영상 다음 결과부터 2번, 3번 순서로 계속 재생합니다.");
+        styleChoiceButton(sequentialOrderButton, !randomOrder);
+        styleChoiceButton(randomOrderButton, randomOrder);
+    }
+
+    private void styleChoiceButton(Button button, boolean selected) {
+        button.setTextColor(selected ? Color.WHITE : Color.rgb(71, 85, 105));
+        button.setBackgroundColor(selected ? Color.rgb(229, 57, 53) : Color.rgb(226, 232, 240));
     }
 
     private void pickFolder() {
@@ -622,6 +704,8 @@ public final class MainActivity extends Activity {
         final int token = ++searchToken;
         final String query = searchInput.getText().toString();
         results.clear();
+        autoplayPlayedKeys.clear();
+        preparingAutoplay = false;
         resultsList.removeAllViews();
         statusView.setText("불러오는 중...");
         loadingMore = true;
@@ -737,7 +821,7 @@ public final class MainActivity extends Activity {
                 Toast.makeText(this, "채널은 재생할 수 없습니다.", Toast.LENGTH_SHORT).show();
                 return;
             }
-            play(item);
+            play(item, true);
         });
         return row;
     }
@@ -745,10 +829,17 @@ public final class MainActivity extends Activity {
     // ---- Playback ----------------------------------------------------------
 
     private void play(TubeItem item) {
+        play(item, true);
+    }
+
+    private void play(TubeItem item, boolean resetAutoplayHistory) {
         currentItem = item;
         currentPlaybackData = null;
         offlinePlaying = false;
         playing = true;
+        if (resetAutoplayHistory) preparingAutoplay = false;
+        if (resetAutoplayHistory) autoplayPlayedKeys.clear();
+        markAutoplayPlayed(item);
         showPlayingLayout(true);
         downloadButton.setVisibility(View.VISIBLE);
         metaView.setText("재생 준비 중: " + item.title);
@@ -758,8 +849,10 @@ public final class MainActivity extends Activity {
                 mainHandler.post(() -> startPlayer(data));
             } catch (Exception e) {
                 mainHandler.post(() -> {
+                    preparingAutoplay = false;
                     metaView.setText("재생 실패: " + e.getMessage());
                     Toast.makeText(this, "재생 가능한 스트림을 찾지 못했습니다.", Toast.LENGTH_LONG).show();
+                    if (!resetAutoplayHistory) maybeAutoPlayNext();
                 });
             }
         });
@@ -767,12 +860,71 @@ public final class MainActivity extends Activity {
 
     private void startPlayer(PlaybackData data) {
         playing = true;
+        preparingAutoplay = false;
         currentPlaybackData = data;
         metaView.setText(buildMeta(data));
         metaScroll.scrollTo(0, 0);
         player.setMediaItem(buildMediaItem(data.mediaUrl));
         player.prepare();
         player.play();
+    }
+
+    private void maybeAutoPlayNext() {
+        if (!playing || offlinePlaying || preparingAutoplay || results.isEmpty()) return;
+        TubeItem next = nextAutoplayItem();
+        if (next == null) {
+            Toast.makeText(this, "재생할 다음 영상이 없습니다.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        preparingAutoplay = true;
+        play(next, false);
+    }
+
+    private TubeItem nextAutoplayItem() {
+        String order = DownloadStore.getNextPlayOrder(this);
+        if (DownloadStore.ORDER_RANDOM.equals(order)) return randomAutoplayItem();
+        return sequentialAutoplayItem();
+    }
+
+    private TubeItem sequentialAutoplayItem() {
+        int start = currentResultIndex();
+        if (start < 0) start = -1;
+        for (int i = start + 1; i < results.size(); i++) {
+            TubeItem candidate = results.get(i);
+            if (isAutoplayCandidate(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    private TubeItem randomAutoplayItem() {
+        List<TubeItem> candidates = new ArrayList<>();
+        for (TubeItem item : results) {
+            if (isAutoplayCandidate(item)) candidates.add(item);
+        }
+        if (candidates.isEmpty()) return null;
+        return candidates.get(random.nextInt(candidates.size()));
+    }
+
+    private boolean isAutoplayCandidate(TubeItem item) {
+        return item != null && item.playable && !autoplayPlayedKeys.contains(autoplayKey(item));
+    }
+
+    private int currentResultIndex() {
+        if (currentItem == null) return -1;
+        String currentKey = autoplayKey(currentItem);
+        for (int i = 0; i < results.size(); i++) {
+            if (currentKey.equals(autoplayKey(results.get(i)))) return i;
+        }
+        return -1;
+    }
+
+    private void markAutoplayPlayed(TubeItem item) {
+        if (item != null) autoplayPlayedKeys.add(autoplayKey(item));
+    }
+
+    private String autoplayKey(TubeItem item) {
+        String id = ExtractorBridge.videoIdOf(item.url);
+        return id.isEmpty() ? item.url : id;
     }
 
     // Shows only the player + description (hides the search bar and result list).
@@ -809,6 +961,8 @@ public final class MainActivity extends Activity {
         offlinePlaying = false;
         currentItem = null;
         currentPlaybackData = null;
+        autoplayPlayedKeys.clear();
+        preparingAutoplay = false;
         player.pause();
         player.clearMediaItems();
         qualityButton.setText("화질");

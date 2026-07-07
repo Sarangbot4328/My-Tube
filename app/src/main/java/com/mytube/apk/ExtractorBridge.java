@@ -144,6 +144,10 @@ final class ExtractorBridge {
     private static List<TubeItem> fallbackSearch(String query, MainActivity.Tab tab) throws Exception {
         String encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.name());
         String html = httpGet("https://www.youtube.com/results?search_query=" + encoded);
+
+        List<TubeItem> innerTubeItems = innerTubeSearch(query, html, tab);
+        if (!innerTubeItems.isEmpty()) return innerTubeItems;
+
         List<TubeItem> items = new ArrayList<>();
 
         if (tab == MainActivity.Tab.CHANNELS) {
@@ -185,6 +189,76 @@ final class ExtractorBridge {
         return items;
     }
 
+    private static List<TubeItem> innerTubeSearch(String query, String bootstrapHtml, MainActivity.Tab tab) throws Exception {
+        String apiKey = match(bootstrapHtml, "\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
+        String clientName = match(bootstrapHtml, "\"INNERTUBE_CLIENT_NAME\":\"([^\"]+)\"");
+        String clientVersion = match(bootstrapHtml, "\"INNERTUBE_CLIENT_VERSION\":\"([^\"]+)\"");
+
+        if (apiKey.isEmpty()) return new ArrayList<>();
+        if (clientName.isEmpty()) clientName = "1";
+        if (clientVersion.isEmpty()) clientVersion = "2.20260707.01.00";
+
+        String payload = "{"
+                + "\"context\":{\"client\":{"
+                + "\"clientName\":\"WEB\","
+                + "\"clientVersion\":\"" + jsonEscape(clientVersion) + "\","
+                + "\"hl\":\"ko\","
+                + "\"gl\":\"KR\""
+                + "}},"
+                + "\"query\":\"" + jsonEscape(query) + "\""
+                + "}";
+        String response = httpPost(
+                "https://www.youtube.com/youtubei/v1/search?key=" + apiKey,
+                payload
+        );
+        return parseRendererBlocks(response, tab, query);
+    }
+
+    private static List<TubeItem> parseRendererBlocks(String text, MainActivity.Tab tab, String query) {
+        List<TubeItem> items = new ArrayList<>();
+
+        if (tab == MainActivity.Tab.CHANNELS) {
+            for (String block : extractJsonObjects(text, "\"channelRenderer\":{")) {
+                String id = match(block, "\"channelId\":\"([^\"]+)\"");
+                String title = clean(match(block, "\"title\":\\{\"simpleText\":\"(.*?)\""));
+                if (title.isEmpty()) title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+                if (id.isEmpty() || title.isEmpty()) continue;
+                items.add(new TubeItem(
+                        title,
+                        "채널",
+                        "https://www.youtube.com/channel/" + id,
+                        bestThumbnailFromBlock(block),
+                        false,
+                        false
+                ));
+                if (items.size() >= 30) break;
+            }
+            return items;
+        }
+
+        for (String block : extractJsonObjects(text, "\"videoRenderer\":{")) {
+            String id = match(block, "\"videoId\":\"([^\"]+)\"");
+            String title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            String channel = clean(match(block, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            if (channel.isEmpty()) channel = clean(match(block, "\"shortBylineText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            String length = clean(match(block, "\"lengthText\":\\{\"simpleText\":\"(.*?)\""));
+            if (id.isEmpty() || title.isEmpty()) continue;
+            boolean shortForm = tab == MainActivity.Tab.SHORTS || block.contains("\"navigationEndpoint\":{\"commandMetadata\":{\"webCommandMetadata\":{\"url\":\"/shorts/");
+            if (tab == MainActivity.Tab.SHORTS && !shortForm && !query.toLowerCase().contains("short")) continue;
+            if (tab == MainActivity.Tab.VIDEOS && shortForm) continue;
+            items.add(new TubeItem(
+                    title,
+                    (channel.isEmpty() ? "YouTube" : channel) + (length.isEmpty() ? "" : " · " + length),
+                    "https://www.youtube.com/watch?v=" + id,
+                    bestThumbnailFromBlock(block),
+                    true,
+                    shortForm
+            ));
+            if (items.size() >= 30) break;
+        }
+        return items;
+    }
+
     private static String httpGet(String url) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setConnectTimeout(15000);
@@ -195,6 +269,32 @@ final class ExtractorBridge {
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
         try (InputStream in = connection.getInputStream();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[16 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
+            return out.toString(StandardCharsets.UTF_8.name());
+        }
+    }
+
+    private static String httpPost(String url, String json) throws Exception {
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(30000);
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setFixedLengthStreamingMode(body.length);
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+        connection.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                        + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+        connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        connection.getOutputStream().write(body);
+        InputStream input = connection.getResponseCode() >= 400
+                ? connection.getErrorStream()
+                : connection.getInputStream();
+        if (input == null) return "";
+        try (InputStream in = input; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16 * 1024];
             int read;
             while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
@@ -267,6 +367,33 @@ final class ExtractorBridge {
 
     private static String cleanUrl(String value) {
         return clean(value).replace("\\u003d", "=");
+    }
+
+    private static String jsonEscape(String value) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '"':
+                    out.append("\\\"");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                case '\t':
+                    out.append("\\t");
+                    break;
+                default:
+                    out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     private static String decodeUnicodeEscapes(String value) {

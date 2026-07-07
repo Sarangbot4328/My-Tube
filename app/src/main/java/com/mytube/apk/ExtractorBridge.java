@@ -295,7 +295,9 @@ final class ExtractorBridge {
         PlaybackData fallback = innerTubeResolve(url);
         if (fallback != null) return fallback;
 
-        throw new IllegalStateException("재생 가능한 스트림을 찾지 못했습니다.");
+        throw new IllegalStateException(
+                "재생 가능한 스트림을 찾지 못했습니다. YouTube가 일시적으로 차단했을 수 있어요 — "
+                        + "잠시 후 다시 시도하거나 Wi-Fi/데이터를 전환해 보세요.");
     }
 
     private static PlaybackData newPipeResolve(String url) throws Exception {
@@ -336,27 +338,59 @@ final class ExtractorBridge {
         );
     }
 
-    // Raw iOS-client player response for a video id (used by playback and download).
-    private static String iosPlayerResponse(String videoId) throws Exception {
+    // One InnerTube "player" client. YouTube periodically blocks individual
+    // clients, so we try several and use whichever still returns streams.
+    private static final class PlayerClient {
+        final String name, version, apiKey, userAgent, clientNameHeader, extraContext;
+        PlayerClient(String name, String version, String apiKey, String userAgent,
+                     String clientNameHeader, String extraContext) {
+            this.name = name;
+            this.version = version;
+            this.apiKey = apiKey;
+            this.userAgent = userAgent;
+            this.clientNameHeader = clientNameHeader;
+            this.extraContext = extraContext;   // trailing-comma JSON fragment or ""
+        }
+    }
+
+    private static final String ANDROID_API_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+    private static final PlayerClient[] PLAYER_CLIENTS = {
+            new PlayerClient("IOS", IOS_CLIENT_VERSION, IOS_API_KEY, IOS_USER_AGENT, "5",
+                    "\"deviceModel\":\"iPhone16,2\","),
+            new PlayerClient("ANDROID_VR", "1.60.19", ANDROID_API_KEY,
+                    "com.google.android.apps.youtube.vr.oculus/1.60.19 "
+                            + "(Linux; U; Android 12L; en_US; Quest 3) gzip", "28",
+                    "\"androidSdkVersion\":32,\"deviceModel\":\"Quest 3\","),
+            new PlayerClient("TVHTML5", "7.20240724.13.00", DEFAULT_API_KEY,
+                    "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/537.36 "
+                            + "(KHTML, like Gecko) 76.0.3809.146 TV Safari/537.36", "7", ""),
+    };
+
+    private static String playerResponse(String videoId, PlayerClient client) throws Exception {
         String payload = "{"
                 + "\"context\":{\"client\":{"
-                + "\"clientName\":\"IOS\","
-                + "\"clientVersion\":\"" + IOS_CLIENT_VERSION + "\","
-                + "\"deviceModel\":\"iPhone16,2\","
+                + "\"clientName\":\"" + client.name + "\","
+                + "\"clientVersion\":\"" + client.version + "\","
+                + client.extraContext
                 + "\"hl\":\"ko\",\"gl\":\"KR\""
                 + "}},"
                 + "\"videoId\":\"" + jsonEscape(videoId) + "\","
                 + "\"contentCheckOk\":true,\"racyCheckOk\":true"
                 + "}";
         Map<String, String> headers = new HashMap<>();
-        headers.put("User-Agent", IOS_USER_AGENT);
-        headers.put("X-YouTube-Client-Name", "5");
-        headers.put("X-YouTube-Client-Version", IOS_CLIENT_VERSION);
+        headers.put("User-Agent", client.userAgent);
+        headers.put("X-YouTube-Client-Name", client.clientNameHeader);
+        headers.put("X-YouTube-Client-Version", client.version);
         return httpPost(
-                "https://www.youtube.com/youtubei/v1/player?key=" + IOS_API_KEY + "&prettyPrint=false",
+                "https://www.youtube.com/youtubei/v1/player?key=" + client.apiKey + "&prettyPrint=false",
                 payload,
                 headers
         );
+    }
+
+    private static boolean isPlayable(String response) {
+        String status = match(response, "\"playabilityStatus\":\\{\"status\":\"([^\"]+)\"");
+        return status.isEmpty() || "OK".equalsIgnoreCase(status);
     }
 
     // A downloadable quality. When muxed==false, videoUrl is a complete progressive
@@ -461,8 +495,21 @@ final class ExtractorBridge {
     private static List<DownloadOption> iosDownloadOptions(String url) throws Exception {
         String videoId = extractVideoId(url);
         if (videoId.isEmpty()) return new ArrayList<>();
-        String response = iosPlayerResponse(videoId);
+        // Try each client; use the first that yields downloadable qualities.
+        for (PlayerClient client : PLAYER_CLIENTS) {
+            try {
+                String response = playerResponse(videoId, client);
+                if (!isPlayable(response)) continue;
+                List<DownloadOption> options = parseDownloadOptions(response);
+                if (!options.isEmpty()) return options;
+            } catch (Exception ignored) {
+                // try the next client
+            }
+        }
+        return new ArrayList<>();
+    }
 
+    private static List<DownloadOption> parseDownloadOptions(String response) {
         // Height -> option, keeping progressive (needs no muxing) when available.
         Map<Integer, DownloadOption> byHeight = new LinkedHashMap<>();
 
@@ -566,12 +613,21 @@ final class ExtractorBridge {
         String videoId = extractVideoId(url);
         if (videoId.isEmpty()) return null;
 
-        String response = iosPlayerResponse(videoId);
+        // Try each client and use the first that returns a playable stream.
+        for (PlayerClient client : PLAYER_CLIENTS) {
+            try {
+                String response = playerResponse(videoId, client);
+                if (!isPlayable(response)) continue;
+                PlaybackData data = parsePlayback(response);
+                if (data != null) return data;
+            } catch (Exception ignored) {
+                // try the next client
+            }
+        }
+        return null;
+    }
 
-        // Only serve a playable video: bail if YouTube reports it can't be played.
-        String status = match(response, "\"playabilityStatus\":\\{\"status\":\"([^\"]+)\"");
-        if (!status.isEmpty() && !"OK".equalsIgnoreCase(status)) return null;
-
+    private static PlaybackData parsePlayback(String response) {
         String title = matchJsonString(response, "title");
         String uploader = matchJsonString(response, "author");
         String description = matchJsonString(response, "shortDescription");

@@ -13,11 +13,20 @@ import androidx.documentfile.provider.DocumentFile;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
 
 // Saves a chosen quality to local storage. Progressive streams are written
 // straight to disk; adaptive (1080p+) qualities download the mp4 video and m4a
@@ -25,6 +34,11 @@ import java.nio.ByteBuffer;
 final class MediaDownloader {
     private static final String USER_AGENT =
             "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)";
+
+    // Split each stream into chunks fetched in parallel — googlevideo throttles a
+    // single connection, so several short Range requests are far faster.
+    private static final int CHUNK_SIZE = 8 * 1024 * 1024;
+    private static final int MAX_PARALLEL = 3;
 
     interface ProgressListener {
         void onProgress(String status);
@@ -40,22 +54,25 @@ final class MediaDownloader {
     static String save(Context context, ExtractorBridge.DownloadOption option, String title,
                        ProgressListener listener) throws Exception {
         String fileName = safeFileName(title, option.ext);
+        File cache = context.getCacheDir();
+
         if (!option.muxed) {
-            return writeToTarget(context, fileName, "video/mp4",
-                    out -> copyUrl(option.videoUrl, out, "다운로드 중", listener));
+            File tmp = File.createTempFile("mtp", ".tmp", cache);
+            try {
+                downloadToFile(option.videoUrl, tmp, "다운로드", listener);
+                report(listener, "저장 중...");
+                return writeToTarget(context, fileName, "video/mp4", out -> copyFile(tmp, out));
+            } finally {
+                tmp.delete();
+            }
         }
 
-        File cache = context.getCacheDir();
         File videoTmp = File.createTempFile("mtv", ".mp4", cache);
         File audioTmp = File.createTempFile("mta", ".m4a", cache);
         File muxed = File.createTempFile("mtmux", ".mp4", cache);
         try {
-            try (OutputStream vo = new FileOutputStream(videoTmp)) {
-                copyUrl(option.videoUrl, vo, "영상 다운로드", listener);
-            }
-            try (OutputStream ao = new FileOutputStream(audioTmp)) {
-                copyUrl(option.audioUrl, ao, "오디오 다운로드", listener);
-            }
+            downloadToFile(option.videoUrl, videoTmp, "영상 다운로드", listener);
+            downloadToFile(option.audioUrl, audioTmp, "오디오 다운로드", listener);
             report(listener, "영상·오디오 합치는 중...");
             muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(), muxed.getAbsolutePath());
             report(listener, "저장 중...");
@@ -69,6 +86,114 @@ final class MediaDownloader {
 
     private static void report(ProgressListener listener, String status) {
         if (listener != null) listener.onProgress(status);
+    }
+
+    // Downloads a URL into dest using parallel Range requests. Falls back to a
+    // single stream when the server doesn't report a length / support ranges.
+    private static void downloadToFile(String url, File dest, String label, ProgressListener listener)
+            throws Exception {
+        long total = probeLength(url);
+        if (total <= 0) {
+            try (OutputStream out = new FileOutputStream(dest)) {
+                copyUrlSingle(url, out, label, listener);
+            }
+            return;
+        }
+
+        try (RandomAccessFile raf = new RandomAccessFile(dest, "rw")) {
+            raf.setLength(total);
+        }
+
+        List<long[]> chunks = new ArrayList<>();
+        for (long start = 0; start < total; start += CHUNK_SIZE) {
+            chunks.add(new long[]{start, Math.min(start + CHUNK_SIZE - 1, total - 1)});
+        }
+
+        final long finalTotal = total;
+        final AtomicLong downloaded = new AtomicLong(0);
+        final AtomicLong lastReport = new AtomicLong(0);
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(MAX_PARALLEL, chunks.size()));
+        List<Future<?>> futures = new ArrayList<>();
+        for (long[] range : chunks) {
+            final long start = range[0];
+            final long end = range[1];
+            futures.add(pool.submit(() -> {
+                downloadChunk(url, dest, start, end, downloaded, finalTotal, lastReport, label, listener);
+                return null;
+            }));
+        }
+        pool.shutdown();
+        try {
+            for (Future<?> f : futures) f.get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            throw new IOException(cause == null ? e.toString() : cause.getMessage());
+        } finally {
+            pool.shutdownNow();
+        }
+        if (listener != null) listener.onProgress(progressText(label, finalTotal, finalTotal));
+    }
+
+    private static void downloadChunk(String url, File dest, long start, long end,
+                                      AtomicLong downloaded, long total, AtomicLong lastReport,
+                                      String label, ProgressListener listener) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setInstanceFollowRedirects(true);
+        connection.setConnectTimeout(20000);
+        connection.setReadTimeout(60000);
+        connection.setRequestProperty("User-Agent", USER_AGENT);
+        connection.setRequestProperty("Range", "bytes=" + start + "-" + end);
+        try {
+            int code = connection.getResponseCode();
+            if (code >= 400) throw new IOException("서버 응답 오류 (HTTP " + code + ")");
+            try (InputStream in = connection.getInputStream();
+                 RandomAccessFile raf = new RandomAccessFile(dest, "rw")) {
+                raf.seek(start);
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    raf.write(buffer, 0, read);
+                    long done = downloaded.addAndGet(read);
+                    if (listener != null && done - lastReport.get() >= 1024 * 1024) {
+                        lastReport.set(done);
+                        listener.onProgress(progressText(label, done, total));
+                    }
+                }
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    // Returns the total content length via a ranged probe, or -1 when the server
+    // doesn't support Range requests (caller then uses a single stream).
+    private static long probeLength(String url) {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setInstanceFollowRedirects(true);
+            connection.setConnectTimeout(20000);
+            connection.setReadTimeout(20000);
+            connection.setRequestProperty("User-Agent", USER_AGENT);
+            connection.setRequestProperty("Range", "bytes=0-0");
+            int code = connection.getResponseCode();
+            String contentRange = connection.getHeaderField("Content-Range");
+            if (code == 206 && contentRange != null) {
+                int slash = contentRange.lastIndexOf('/');
+                if (slash >= 0) {
+                    try {
+                        return Long.parseLong(contentRange.substring(slash + 1).trim());
+                    } catch (NumberFormatException ignored) {
+                        return -1;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // no range support / network issue — caller falls back to single stream
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+        return -1;
     }
 
     // Writes to the user's chosen folder (SAF) when set, else the app's own
@@ -106,7 +231,7 @@ final class MediaDownloader {
         return Uri.fromFile(file).toString();
     }
 
-    private static void copyUrl(String url, OutputStream out, String label, ProgressListener listener)
+    private static void copyUrlSingle(String url, OutputStream out, String label, ProgressListener listener)
             throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setInstanceFollowRedirects(true);

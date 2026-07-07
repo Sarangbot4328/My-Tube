@@ -7,10 +7,12 @@ import org.schabi.newpipe.extractor.NewPipe;
 import org.schabi.newpipe.extractor.Page;
 import org.schabi.newpipe.extractor.ServiceList;
 import org.schabi.newpipe.extractor.linkhandler.SearchQueryHandler;
+import org.schabi.newpipe.extractor.MediaFormat;
 import org.schabi.newpipe.extractor.localization.ContentCountry;
 import org.schabi.newpipe.extractor.localization.Localization;
 import org.schabi.newpipe.extractor.search.SearchInfo;
 import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeSearchQueryHandlerFactory;
+import org.schabi.newpipe.extractor.stream.AudioStream;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.StreamInfoItem;
 import org.schabi.newpipe.extractor.stream.VideoStream;
@@ -386,6 +388,77 @@ final class ExtractorBridge {
     // cleanly into an mp4 container.
     static List<DownloadOption> downloadOptions(String url) throws Exception {
         init();
+        // Prefer NewPipe: it resolves de-throttled, deciphered stream URLs for the
+        // same videos we can play (the iOS client omits direct URLs for many official
+        // videos, which is why downloads showed "no qualities"). Fall back to iOS.
+        try {
+            List<DownloadOption> options = newPipeDownloadOptions(url);
+            if (!options.isEmpty()) return options;
+        } catch (Exception ignored) {
+            // fall through to the iOS client
+        }
+        return iosDownloadOptions(url);
+    }
+
+    private static List<DownloadOption> newPipeDownloadOptions(String url) throws Exception {
+        StreamInfo info = StreamInfo.getInfo(ServiceList.YouTube, url);
+        Map<Integer, DownloadOption> byHeight = new LinkedHashMap<>();
+
+        // Progressive muxed streams already contain audio + video.
+        for (VideoStream vs : info.getVideoStreams()) {
+            if (!vs.isUrl() || vs.isVideoOnly()) continue;
+            String streamUrl = vs.getContent();
+            if (streamUrl == null || streamUrl.isEmpty()) continue;
+            int height = parseHeight(vs.getResolution());
+            byHeight.put(height, new DownloadOption(
+                    resolutionLabel(vs.getResolution(), height), streamUrl, null,
+                    suffixOf(vs.getFormat()), "video/mp4", false, height));
+        }
+
+        // Best AAC (m4a) audio track to pair with adaptive mp4 video (1080p+).
+        AudioStream bestAudio = null;
+        for (AudioStream as : info.getAudioStreams()) {
+            if (!as.isUrl() || as.getContent() == null || as.getContent().isEmpty()) continue;
+            if (as.getFormat() != MediaFormat.M4A) continue;
+            if (bestAudio == null || as.getAverageBitrate() > bestAudio.getAverageBitrate()) bestAudio = as;
+        }
+
+        if (bestAudio != null) {
+            for (VideoStream vs : info.getVideoOnlyStreams()) {
+                if (!vs.isUrl() || vs.getFormat() != MediaFormat.MPEG_4) continue;   // H.264 mp4 only
+                String streamUrl = vs.getContent();
+                if (streamUrl == null || streamUrl.isEmpty()) continue;
+                int height = parseHeight(vs.getResolution());
+                if (byHeight.containsKey(height)) continue;   // progressive already covers it
+                byHeight.put(height, new DownloadOption(
+                        resolutionLabel(vs.getResolution(), height), streamUrl, bestAudio.getContent(),
+                        "mp4", "video/mp4", true, height));
+            }
+        }
+
+        List<DownloadOption> options = new ArrayList<>(byHeight.values());
+        options.sort((a, b) -> Integer.compare(b.height, a.height));
+        return options;
+    }
+
+    private static int parseHeight(String resolution) {
+        if (resolution == null) return 0;
+        Matcher matcher = Pattern.compile("(\\d+)").matcher(resolution);
+        return matcher.find() ? intOf(matcher.group(1)) : 0;
+    }
+
+    private static String resolutionLabel(String resolution, int height) {
+        if (resolution != null && !resolution.isEmpty()) return resolution;
+        return height > 0 ? height + "p" : "기본 화질";
+    }
+
+    private static String suffixOf(MediaFormat format) {
+        if (format == null) return "mp4";
+        String suffix = format.getSuffix();
+        return suffix == null || suffix.isEmpty() ? "mp4" : suffix;
+    }
+
+    private static List<DownloadOption> iosDownloadOptions(String url) throws Exception {
         String videoId = extractVideoId(url);
         if (videoId.isEmpty()) return new ArrayList<>();
         String response = iosPlayerResponse(videoId);

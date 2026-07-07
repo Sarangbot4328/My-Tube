@@ -12,10 +12,18 @@ import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.StreamInfoItem;
 import org.schabi.newpipe.extractor.stream.VideoStream;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 final class ExtractorBridge {
     private static boolean initialized;
@@ -61,6 +69,9 @@ final class ExtractorBridge {
                         false
                 ));
             }
+        }
+        if (items.isEmpty()) {
+            items.addAll(fallbackSearch(actualQuery, tab));
         }
         return items;
     }
@@ -128,5 +139,144 @@ final class ExtractorBridge {
         long s = seconds % 60;
         if (h > 0) return String.format("%d:%02d:%02d", h, m, s);
         return String.format("%d:%02d", m, s);
+    }
+
+    private static List<TubeItem> fallbackSearch(String query, MainActivity.Tab tab) throws Exception {
+        String encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.name());
+        String html = httpGet("https://www.youtube.com/results?search_query=" + encoded);
+        List<TubeItem> items = new ArrayList<>();
+
+        if (tab == MainActivity.Tab.CHANNELS) {
+            for (String block : extractJsonObjects(html, "\"channelRenderer\":{")) {
+                String id = match(block, "\"channelId\":\"([^\"]+)\"");
+                String title = clean(match(block, "\"title\":\\{\"simpleText\":\"(.*?)\""));
+                if (title.isEmpty()) title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+                if (id.isEmpty() || title.isEmpty()) continue;
+                items.add(new TubeItem(
+                        title,
+                        "채널",
+                        "https://www.youtube.com/channel/" + id,
+                        bestThumbnailFromBlock(block),
+                        false,
+                        false
+                ));
+                if (items.size() >= 30) break;
+            }
+            return items;
+        }
+
+        for (String block : extractJsonObjects(html, "\"videoRenderer\":{")) {
+            String id = match(block, "\"videoId\":\"([^\"]+)\"");
+            String title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            String channel = clean(match(block, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            String length = clean(match(block, "\"lengthText\":\\{\"simpleText\":\"(.*?)\""));
+            if (id.isEmpty() || title.isEmpty()) continue;
+            if (tab == MainActivity.Tab.SHORTS && !query.toLowerCase().contains("short")) continue;
+            items.add(new TubeItem(
+                    title,
+                    (channel.isEmpty() ? "YouTube" : channel) + (length.isEmpty() ? "" : " · " + length),
+                    "https://www.youtube.com/watch?v=" + id,
+                    bestThumbnailFromBlock(block),
+                    true,
+                    tab == MainActivity.Tab.SHORTS
+            ));
+            if (items.size() >= 30) break;
+        }
+        return items;
+    }
+
+    private static String httpGet(String url) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(30000);
+        connection.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                        + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+        connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        try (InputStream in = connection.getInputStream();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[16 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
+            return out.toString(StandardCharsets.UTF_8.name());
+        }
+    }
+
+    private static List<String> extractJsonObjects(String text, String marker) {
+        List<String> blocks = new ArrayList<>();
+        int searchFrom = 0;
+        while (true) {
+            int markerIndex = text.indexOf(marker, searchFrom);
+            if (markerIndex < 0) break;
+            int start = markerIndex + marker.length() - 1;
+            int depth = 0;
+            boolean inString = false;
+            boolean escaped = false;
+            for (int i = start; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (c == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (c == '"') {
+                    inString = !inString;
+                    continue;
+                }
+                if (inString) continue;
+                if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) {
+                        blocks.add(text.substring(start, i + 1));
+                        searchFrom = i + 1;
+                        break;
+                    }
+                }
+            }
+            if (searchFrom <= markerIndex) break;
+        }
+        return blocks;
+    }
+
+    private static String bestThumbnailFromBlock(String block) {
+        Matcher matcher = Pattern.compile("\"url\":\"(https(?::|\\\\u003a)[^\"]+)\"").matcher(block);
+        String url = "";
+        while (matcher.find()) url = matcher.group(1);
+        return cleanUrl(url);
+    }
+
+    private static String match(String text, String regex) {
+        Matcher matcher = Pattern.compile(regex, Pattern.DOTALL).matcher(text);
+        return matcher.find() ? matcher.group(1) : "";
+    }
+
+    private static String clean(String value) {
+        return decodeUnicodeEscapes(value == null ? "" : value)
+                .replace("\\u0026", "&")
+                .replace("\\u003d", "=")
+                .replace("\\u003a", ":")
+                .replace("\\\"", "\"")
+                .replace("\\/", "/")
+                .replace("&amp;", "&")
+                .trim();
+    }
+
+    private static String cleanUrl(String value) {
+        return clean(value).replace("\\u003d", "=");
+    }
+
+    private static String decodeUnicodeEscapes(String value) {
+        Matcher matcher = Pattern.compile("\\\\u([0-9a-fA-F]{4})").matcher(value);
+        StringBuffer buffer = new StringBuffer();
+        while (matcher.find()) {
+            char decoded = (char) Integer.parseInt(matcher.group(1), 16);
+            matcher.appendReplacement(buffer, Matcher.quoteReplacement(String.valueOf(decoded)));
+        }
+        matcher.appendTail(buffer);
+        return buffer.toString();
     }
 }

@@ -23,6 +23,8 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -878,6 +880,9 @@ final class ExtractorBridge {
         }
         if (value.contains("어제") || value.contains("yesterday")) return 24L * 60L * 60L;
 
+        long absoluteAge = parseAbsoluteDateAgeSeconds(value);
+        if (absoluteAge >= 0) return absoluteAge;
+
         Matcher matcher = Pattern.compile("(\\d+)\\s*([가-힣a-z]+)").matcher(value);
         if (!matcher.find()) return Long.MAX_VALUE;
         long amount = parseLong(matcher.group(1));
@@ -894,6 +899,28 @@ final class ExtractorBridge {
             return amount * 365L * 24L * 60L * 60L;
         }
         return Long.MAX_VALUE;
+    }
+
+    private static long parseAbsoluteDateAgeSeconds(String value) {
+        Matcher korean = Pattern.compile("(\\d{4})\\s*[.년/-]\\s*(\\d{1,2})\\s*[.월/-]\\s*(\\d{1,2})").matcher(value);
+        if (korean.find()) {
+            return ageSeconds(korean.group(1), korean.group(2), korean.group(3));
+        }
+        Matcher iso = Pattern.compile("(\\d{4})-(\\d{1,2})-(\\d{1,2})").matcher(value);
+        if (iso.find()) {
+            return ageSeconds(iso.group(1), iso.group(2), iso.group(3));
+        }
+        return -1;
+    }
+
+    private static long ageSeconds(String year, String month, String day) {
+        try {
+            LocalDate published = LocalDate.of(intOf(year), intOf(month), intOf(day));
+            long days = ChronoUnit.DAYS.between(published, LocalDate.now());
+            return Math.max(0, days) * 24L * 60L * 60L;
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     private static String httpGet(String url) throws Exception {

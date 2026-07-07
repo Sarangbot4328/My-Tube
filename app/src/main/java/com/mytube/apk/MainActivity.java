@@ -229,7 +229,8 @@ public final class MainActivity extends Activity {
         playerView = new PlayerView(this);
         playerView.setPlayer(player);
         playerView.setBackgroundColor(Color.BLACK);
-        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
+        playerView.setShutterBackgroundColor(Color.BLACK);
+        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
         playerView.setVisibility(View.GONE);
         playerView.setFullscreenButtonClickListener(this::setFullscreen);
         screen.addView(playerView, new LinearLayout.LayoutParams(-1, dp(220)));
@@ -624,12 +625,18 @@ public final class MainActivity extends Activity {
         resultsList.removeAllViews();
         statusView.setText("불러오는 중...");
         loadingMore = true;
-        session = ExtractorBridge.newSearch(query, Tab.YOUTUBE, currentSort);
+        final ExtractorBridge.SortOrder requestedSort = currentSort;
+        session = ExtractorBridge.newSearch(query, Tab.YOUTUBE, requestedSort);
         final ExtractorBridge.SearchSession active = session;
         executor.execute(() -> {
             try {
                 List<TubeItem> batch = new ArrayList<>(active.loadMore());
-                if (batch.size() < 25 && active.hasMore()) batch.addAll(active.loadMore());
+                int target = requestedSort == ExtractorBridge.SortOrder.DATE ? 80 : 25;
+                while (batch.size() < target && active.hasMore()) {
+                    List<TubeItem> more = active.loadMore();
+                    if (more.isEmpty()) break;
+                    batch.addAll(more);
+                }
                 mainHandler.post(() -> {
                     if (token != searchToken) return;
                     onBatchLoaded(batch);
@@ -667,7 +674,8 @@ public final class MainActivity extends Activity {
 
     private void onBatchLoaded(List<TubeItem> batch) {
         results.addAll(batch);
-        for (TubeItem item : batch) resultsList.addView(createResultRow(item));
+        sortCurrentResults();
+        renderResults();
         if (results.isEmpty()) {
             statusView.setText("결과가 없습니다.");
         } else {
@@ -675,6 +683,17 @@ public final class MainActivity extends Activity {
             statusView.setText(results.size() + "개 결과" + (more ? " · 아래로 스크롤하면 더 보기" : ""));
         }
         loadingMore = false;
+    }
+
+    private void sortCurrentResults() {
+        if (currentSort == ExtractorBridge.SortOrder.DATE) {
+            results.sort((a, b) -> Long.compare(a.publishedAgeSeconds, b.publishedAgeSeconds));
+        }
+    }
+
+    private void renderResults() {
+        resultsList.removeAllViews();
+        for (TubeItem item : results) resultsList.addView(createResultRow(item));
     }
 
     private LinearLayout createResultRow(TubeItem item) {

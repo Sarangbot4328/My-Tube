@@ -29,9 +29,11 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.media3.common.C;
+import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.Player;
+import androidx.media3.common.TrackSelectionOverride;
 import androidx.media3.common.Tracks;
 import androidx.media3.common.VideoSize;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -65,10 +67,31 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private static final class QualityOption {
+        final String label;
+        final String value;
+        final int targetHeight;
+
+        QualityOption(String label, String value, int targetHeight) {
+            this.label = label;
+            this.value = value;
+            this.targetHeight = targetHeight;
+        }
+    }
+
     private static final SortOption[] SORTS = {
             new SortOption("관련성", ExtractorBridge.SortOrder.RELEVANCE),
             new SortOption("최신", ExtractorBridge.SortOrder.DATE),
             new SortOption("평점", ExtractorBridge.SortOrder.RATING),
+    };
+
+    private static final QualityOption[] QUALITY_OPTIONS = {
+            new QualityOption("최저", DownloadStore.QUALITY_LOWEST, -1),
+            new QualityOption("420p", "420", 420),
+            new QualityOption("540p", "540", 540),
+            new QualityOption("720p", "720", 720),
+            new QualityOption("1080p", "1080", 1080),
+            new QualityOption("최고", DownloadStore.QUALITY_HIGHEST, -2),
     };
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
@@ -110,6 +133,8 @@ public final class MainActivity extends Activity {
     private TextView nextPlayOrderText;
     private Button sequentialOrderButton;
     private Button randomOrderButton;
+    private TextView defaultQualityText;
+    private final List<Button> defaultQualityButtons = new ArrayList<>();
 
     private ExtractorBridge.SortOrder currentSort = ExtractorBridge.SortOrder.RELEVANCE;
     private ExtractorBridge.SearchSession session;
@@ -123,6 +148,7 @@ public final class MainActivity extends Activity {
     private boolean offlinePlaying;
     private boolean loadingMore;
     private boolean preparingAutoplay;
+    private boolean defaultQualityApplied;
     private int searchToken;
 
     @Override
@@ -141,6 +167,7 @@ public final class MainActivity extends Activity {
             @Override
             public void onTracksChanged(Tracks tracks) {
                 updateQualityLabel();
+                applyDefaultQualityIfNeeded(tracks);
             }
 
             @Override
@@ -502,6 +529,7 @@ public final class MainActivity extends Activity {
         downloadButton.setVisibility(View.GONE);
         metaView.setText(item.title + (item.uploader.isEmpty() ? "" : "\n\n" + item.uploader) + "\n\n오프라인 재생");
         player.setMediaItem(buildMediaItem(item.uri));
+        resetDefaultQualityForNewMedia();
         player.prepare();
         player.play();
     }
@@ -522,7 +550,7 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.1");
+        version.setText("버전 My Tube 1.2");
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
         version.setPadding(dp(16), 0, dp(16), dp(14));
@@ -559,6 +587,35 @@ public final class MainActivity extends Activity {
         randomLp.setMargins(dp(8), 0, 0, 0);
         playOrderRow.addView(randomOrderButton, randomLp);
         screen.addView(playOrderRow);
+
+        TextView qualityLabel = new TextView(this);
+        qualityLabel.setText("기본 화질");
+        qualityLabel.setTextColor(Color.rgb(15, 23, 42));
+        qualityLabel.setTextSize(15);
+        qualityLabel.setPadding(dp(16), dp(6), dp(16), dp(4));
+        screen.addView(qualityLabel);
+
+        defaultQualityText = new TextView(this);
+        defaultQualityText.setTextColor(Color.rgb(71, 85, 105));
+        defaultQualityText.setTextSize(13);
+        defaultQualityText.setPadding(dp(16), 0, dp(16), dp(8));
+        screen.addView(defaultQualityText);
+
+        LinearLayout qualityRowTop = new LinearLayout(this);
+        qualityRowTop.setOrientation(LinearLayout.HORIZONTAL);
+        qualityRowTop.setPadding(dp(12), 0, dp(12), dp(6));
+        addDefaultQualityButton(qualityRowTop, QUALITY_OPTIONS[0]);
+        addDefaultQualityButton(qualityRowTop, QUALITY_OPTIONS[1]);
+        addDefaultQualityButton(qualityRowTop, QUALITY_OPTIONS[2]);
+        screen.addView(qualityRowTop);
+
+        LinearLayout qualityRowBottom = new LinearLayout(this);
+        qualityRowBottom.setOrientation(LinearLayout.HORIZONTAL);
+        qualityRowBottom.setPadding(dp(12), 0, dp(12), dp(12));
+        addDefaultQualityButton(qualityRowBottom, QUALITY_OPTIONS[3]);
+        addDefaultQualityButton(qualityRowBottom, QUALITY_OPTIONS[4]);
+        addDefaultQualityButton(qualityRowBottom, QUALITY_OPTIONS[5]);
+        screen.addView(qualityRowBottom);
 
         TextView label = new TextView(this);
         label.setText("다운로드 저장 폴더");
@@ -605,6 +662,35 @@ public final class MainActivity extends Activity {
             folderText.setText(Uri.decode(folder));
         }
         refreshNextPlayOrderUi();
+        refreshDefaultQualityUi();
+    }
+
+    private void addDefaultQualityButton(LinearLayout row, QualityOption option) {
+        Button button = new Button(this);
+        button.setText(option.label);
+        button.setAllCaps(false);
+        button.setTextSize(12);
+        button.setOnClickListener(v -> setDefaultQuality(option.value));
+        defaultQualityButtons.add(button);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(42), 1);
+        lp.setMargins(dp(3), 0, dp(3), 0);
+        row.addView(button, lp);
+    }
+
+    private void setDefaultQuality(String quality) {
+        DownloadStore.setDefaultQuality(this, quality);
+        refreshDefaultQualityUi();
+        Toast.makeText(this, "기본 화질을 " + defaultQualityLabel(quality) + "로 설정했습니다.", Toast.LENGTH_SHORT).show();
+    }
+
+    private void refreshDefaultQualityUi() {
+        if (defaultQualityText == null || defaultQualityButtons.isEmpty()) return;
+        String quality = DownloadStore.getDefaultQuality(this);
+        defaultQualityText.setText("영상 재생 시 " + defaultQualityLabel(quality)
+                + "에 가장 가까운 화질로 시작합니다.");
+        for (int i = 0; i < defaultQualityButtons.size() && i < QUALITY_OPTIONS.length; i++) {
+            styleChoiceButton(defaultQualityButtons.get(i), QUALITY_OPTIONS[i].value.equals(quality));
+        }
     }
 
     private void setNextPlayOrder(String order) {
@@ -629,6 +715,13 @@ public final class MainActivity extends Activity {
     private void styleChoiceButton(Button button, boolean selected) {
         button.setTextColor(selected ? Color.WHITE : Color.rgb(71, 85, 105));
         button.setBackgroundColor(selected ? Color.rgb(229, 57, 53) : Color.rgb(226, 232, 240));
+    }
+
+    private String defaultQualityLabel(String quality) {
+        for (QualityOption option : QUALITY_OPTIONS) {
+            if (option.value.equals(quality)) return option.label;
+        }
+        return "최고";
     }
 
     private void pickFolder() {
@@ -865,8 +958,85 @@ public final class MainActivity extends Activity {
         metaView.setText(buildMeta(data));
         metaScroll.scrollTo(0, 0);
         player.setMediaItem(buildMediaItem(data.mediaUrl));
+        resetDefaultQualityForNewMedia();
         player.prepare();
         player.play();
+    }
+
+    private void resetDefaultQualityForNewMedia() {
+        try {
+            player.setTrackSelectionParameters(player.getTrackSelectionParameters()
+                    .buildUpon()
+                    .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                    .build());
+        } catch (Exception ignored) {
+            // Some stream types expose no selectable video tracks.
+        }
+        defaultQualityApplied = false;
+    }
+
+    private void applyDefaultQualityIfNeeded(Tracks tracks) {
+        if (defaultQualityApplied || tracks == null) return;
+        String quality = DownloadStore.getDefaultQuality(this);
+        try {
+            TrackSelectionOverride override = preferredVideoOverride(tracks, quality);
+            if (override == null) return;
+            defaultQualityApplied = true;
+            player.setTrackSelectionParameters(player.getTrackSelectionParameters()
+                    .buildUpon()
+                    .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                    .setOverrideForType(override)
+                    .build());
+        } catch (Exception ignored) {
+            defaultQualityApplied = true;
+        }
+    }
+
+    private TrackSelectionOverride preferredVideoOverride(Tracks tracks, String quality) {
+        Tracks.Group bestGroup = null;
+        int bestTrack = -1;
+        int bestDiff = Integer.MAX_VALUE;
+        int bestHeight = -1;
+        int targetHeight = 0;
+        boolean lowest = DownloadStore.QUALITY_LOWEST.equals(quality);
+        boolean highest = DownloadStore.QUALITY_HIGHEST.equals(quality);
+        if (!lowest && !highest) targetHeight = Integer.parseInt(quality);
+
+        for (Tracks.Group group : tracks.getGroups()) {
+            if (group.getType() != C.TRACK_TYPE_VIDEO) continue;
+            for (int i = 0; i < group.length; i++) {
+                if (!group.isTrackSupported(i)) continue;
+                Format format = group.getTrackFormat(i);
+                int height = format.height;
+                if (height <= 0) continue;
+                if (lowest) {
+                    if (bestHeight < 0 || height < bestHeight) {
+                        bestGroup = group;
+                        bestTrack = i;
+                        bestHeight = height;
+                    }
+                    continue;
+                }
+                if (highest) {
+                    if (height > bestHeight) {
+                        bestGroup = group;
+                        bestTrack = i;
+                        bestHeight = height;
+                    }
+                    continue;
+                }
+                int diff = Math.abs(height - targetHeight);
+                if (diff < bestDiff || (diff == bestDiff && height > bestHeight)) {
+                    bestGroup = group;
+                    bestTrack = i;
+                    bestDiff = diff;
+                    bestHeight = height;
+                }
+            }
+        }
+
+        if (bestGroup == null || bestTrack < 0) return null;
+        return new TrackSelectionOverride(bestGroup.getMediaTrackGroup(), bestTrack);
     }
 
     private void maybeAutoPlayNext() {

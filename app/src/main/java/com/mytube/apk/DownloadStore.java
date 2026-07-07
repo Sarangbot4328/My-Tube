@@ -16,8 +16,11 @@ final class DownloadStore {
     private static final String KEY_ITEMS = "items";
     private static final String KEY_FOLDER_URI = "folder_uri";
     private static final String KEY_NEXT_PLAY_ORDER = "next_play_order";
+    private static final String KEY_DEFAULT_QUALITY = "default_quality";
     static final String ORDER_SEQUENTIAL = "sequential";
     static final String ORDER_RANDOM = "random";
+    static final String QUALITY_LOWEST = "lowest";
+    static final String QUALITY_HIGHEST = "highest";
 
     private DownloadStore() {}
 
@@ -121,5 +124,28 @@ final class DownloadStore {
                 .putString(KEY_NEXT_PLAY_ORDER,
                         ORDER_RANDOM.equals(order) ? ORDER_RANDOM : ORDER_SEQUENTIAL)
                 .apply();
+    }
+
+    static String getDefaultQuality(Context c) {
+        String quality = prefs(c).getString(KEY_DEFAULT_QUALITY, QUALITY_HIGHEST);
+        if (QUALITY_LOWEST.equals(quality) || QUALITY_HIGHEST.equals(quality)
+                || "420".equals(quality) || "540".equals(quality)
+                || "720".equals(quality) || "1080".equals(quality)) {
+            return quality;
+        }
+        return QUALITY_HIGHEST;
+    }
+
+    static void setDefaultQuality(Context c, String quality) {
+        prefs(c).edit().putString(KEY_DEFAULT_QUALITY, normalizeQuality(quality)).apply();
+    }
+
+    private static String normalizeQuality(String quality) {
+        if (QUALITY_LOWEST.equals(quality) || QUALITY_HIGHEST.equals(quality)
+                || "420".equals(quality) || "540".equals(quality)
+                || "720".equals(quality) || "1080".equals(quality)) {
+            return quality;
+        }
+        return QUALITY_HIGHEST;
     }
 }

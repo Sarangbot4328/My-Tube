@@ -21,12 +21,28 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 final class ExtractorBridge {
     private static boolean initialized;
+
+    // Well-known public InnerTube WEB API key, used as a fallback when the key
+    // can't be scraped from the bootstrap HTML.
+    private static final String DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+    private static final String DEFAULT_CLIENT_VERSION = "2.20240718.01.00";
+    // Skips YouTube's EU/consent interstitial that otherwise returns an unusable page.
+    private static final String CONSENT_COOKIE = "SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+000";
+
+    // iOS InnerTube client — its player response exposes a directly-playable HLS
+    // manifest (muxed audio+video) with no JS signature deciphering required.
+    private static final String IOS_API_KEY = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc";
+    private static final String IOS_CLIENT_VERSION = "19.29.1";
+    private static final String IOS_USER_AGENT =
+            "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)";
 
     static synchronized void init() {
         if (initialized) return;
@@ -41,6 +57,21 @@ final class ExtractorBridge {
             actualQuery = actualQuery + " shorts";
         }
 
+        // 1) Try the bundled NewPipe extractor. YouTube changes often, so this
+        //    can throw or return nothing on outdated extractor versions — in that
+        //    case we must still fall through to the direct fallback below.
+        try {
+            List<TubeItem> items = newPipeSearch(actualQuery, tab);
+            if (!items.isEmpty()) return items;
+        } catch (Exception ignored) {
+            // fall through to the direct InnerTube/HTML fallback
+        }
+
+        // 2) Direct fallback: InnerTube API first, then HTML scraping.
+        return fallbackSearch(actualQuery, tab);
+    }
+
+    private static List<TubeItem> newPipeSearch(String actualQuery, MainActivity.Tab tab) throws Exception {
         List<String> filters = Arrays.asList(tab == MainActivity.Tab.CHANNELS
                 ? YoutubeSearchQueryHandlerFactory.CHANNELS
                 : YoutubeSearchQueryHandlerFactory.VIDEOS);
@@ -70,14 +101,30 @@ final class ExtractorBridge {
                 ));
             }
         }
-        if (items.isEmpty()) {
-            items.addAll(fallbackSearch(actualQuery, tab));
-        }
         return items;
     }
 
     static PlaybackData resolve(String url) throws Exception {
         init();
+        // 1) Bundled NewPipe extractor. Can throw or come back empty on outdated
+        //    versions / new YouTube changes, so we must fall through on failure.
+        try {
+            PlaybackData data = newPipeResolve(url);
+            if (data != null) return data;
+        } catch (Exception ignored) {
+            // fall through to the InnerTube player fallback
+        }
+
+        // 2) Fallback: ask YouTube's InnerTube player endpoint using the iOS
+        //    client, which returns a directly-playable, ad-free HLS manifest
+        //    (muxed audio+video) without any JS signature deciphering.
+        PlaybackData fallback = innerTubeResolve(url);
+        if (fallback != null) return fallback;
+
+        throw new IllegalStateException("재생 가능한 스트림을 찾지 못했습니다.");
+    }
+
+    private static PlaybackData newPipeResolve(String url) throws Exception {
         StreamInfo info = StreamInfo.getInfo(ServiceList.YouTube, url);
         String mediaUrl = firstNonEmpty(info.getHlsUrl(), info.getDashMpdUrl());
         boolean manifest = mediaUrl != null && !mediaUrl.isEmpty();
@@ -96,11 +143,79 @@ final class ExtractorBridge {
             if (best != null) mediaUrl = best.getContent();
         }
 
-        if (mediaUrl == null || mediaUrl.isEmpty()) {
-            throw new IllegalStateException("재생 가능한 스트림을 찾지 못했습니다.");
-        }
+        if (mediaUrl == null || mediaUrl.isEmpty()) return null;
 
         return new PlaybackData(info.getName(), info.getUploaderName(), mediaUrl, manifest);
+    }
+
+    private static PlaybackData innerTubeResolve(String url) throws Exception {
+        String videoId = extractVideoId(url);
+        if (videoId.isEmpty()) return null;
+
+        String payload = "{"
+                + "\"context\":{\"client\":{"
+                + "\"clientName\":\"IOS\","
+                + "\"clientVersion\":\"" + IOS_CLIENT_VERSION + "\","
+                + "\"deviceModel\":\"iPhone16,2\","
+                + "\"hl\":\"ko\",\"gl\":\"KR\""
+                + "}},"
+                + "\"videoId\":\"" + jsonEscape(videoId) + "\","
+                + "\"contentCheckOk\":true,\"racyCheckOk\":true"
+                + "}";
+
+        Map<String, String> headers = new HashMap<>();
+        headers.put("User-Agent", IOS_USER_AGENT);
+        headers.put("X-YouTube-Client-Name", "5");
+        headers.put("X-YouTube-Client-Version", IOS_CLIENT_VERSION);
+
+        String response = httpPost(
+                "https://www.youtube.com/youtubei/v1/player?key=" + IOS_API_KEY + "&prettyPrint=false",
+                payload,
+                headers
+        );
+
+        // Only serve a playable video: bail if YouTube reports it can't be played.
+        String status = match(response, "\"playabilityStatus\":\\{\"status\":\"([^\"]+)\"");
+        if (!status.isEmpty() && !"OK".equalsIgnoreCase(status)) return null;
+
+        String title = clean(match(response, "\"videoDetails\":\\{.*?\"title\":\"([^\"]*)\""));
+        if (title.isEmpty()) title = clean(match(response, "\"title\":\"([^\"]*)\""));
+        String uploader = clean(match(response, "\"author\":\"([^\"]*)\""));
+
+        // Prefer the HLS manifest: one URL, muxed audio+video, adaptive, ad-free.
+        String hls = cleanUrl(match(response, "\"hlsManifestUrl\":\"([^\"]+)\""));
+        if (!hls.isEmpty()) return new PlaybackData(title, uploader, hls, true);
+
+        // Otherwise a progressive muxed stream (has both audio and video in one URL).
+        String progressive = firstProgressiveUrl(response);
+        if (!progressive.isEmpty()) return new PlaybackData(title, uploader, progressive, false);
+
+        return null;
+    }
+
+    private static String extractVideoId(String url) {
+        if (url == null) return "";
+        String id = match(url, "[?&]v=([A-Za-z0-9_-]{11})");
+        if (!id.isEmpty()) return id;
+        id = match(url, "/shorts/([A-Za-z0-9_-]{11})");
+        if (!id.isEmpty()) return id;
+        id = match(url, "youtu\\.be/([A-Za-z0-9_-]{11})");
+        if (!id.isEmpty()) return id;
+        return match(url, "/embed/([A-Za-z0-9_-]{11})");
+    }
+
+    // Picks the last (highest-quality) muxed progressive stream URL from the
+    // player response's "formats" array — adaptiveFormats are video- or
+    // audio-only, so we deliberately stop before them.
+    private static String firstProgressiveUrl(String response) {
+        int start = response.indexOf("\"formats\":[");
+        if (start < 0) return "";
+        int end = response.indexOf("\"adaptiveFormats\"", start);
+        String section = end > start ? response.substring(start, end) : response.substring(start);
+        Matcher matcher = Pattern.compile("\"url\":\"([^\"]+)\"").matcher(section);
+        String best = "";
+        while (matcher.find()) best = matcher.group(1);
+        return cleanUrl(best);
     }
 
     private static String defaultQuery(MainActivity.Tab tab) {
@@ -143,12 +258,22 @@ final class ExtractorBridge {
 
     private static List<TubeItem> fallbackSearch(String query, MainActivity.Tab tab) throws Exception {
         String encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.name());
-        String html = httpGet("https://www.youtube.com/results?search_query=" + encoded);
+
+        // Fetch the results page for both (a) parsing embedded JSON and
+        // (b) scraping the current InnerTube key/client version. Never let a
+        // failed fetch abort the whole search — try InnerTube with defaults too.
+        String html = "";
+        try {
+            html = httpGet("https://www.youtube.com/results?search_query=" + encoded);
+        } catch (Exception ignored) {
+            // network hiccup on the HTML page — InnerTube with defaults may still work
+        }
 
         List<TubeItem> innerTubeItems = innerTubeSearch(query, html, tab);
         if (!innerTubeItems.isEmpty()) return innerTubeItems;
 
         List<TubeItem> items = new ArrayList<>();
+        if (html.isEmpty()) return items;
 
         if (tab == MainActivity.Tab.CHANNELS) {
             for (String block : extractJsonObjects(html, "\"channelRenderer\":{")) {
@@ -191,12 +316,12 @@ final class ExtractorBridge {
 
     private static List<TubeItem> innerTubeSearch(String query, String bootstrapHtml, MainActivity.Tab tab) throws Exception {
         String apiKey = match(bootstrapHtml, "\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
-        String clientName = match(bootstrapHtml, "\"INNERTUBE_CLIENT_NAME\":\"([^\"]+)\"");
         String clientVersion = match(bootstrapHtml, "\"INNERTUBE_CLIENT_VERSION\":\"([^\"]+)\"");
 
-        if (apiKey.isEmpty()) return new ArrayList<>();
-        if (clientName.isEmpty()) clientName = "1";
-        if (clientVersion.isEmpty()) clientVersion = "2.20260707.01.00";
+        // Fall back to well-known constants when the bootstrap page couldn't be
+        // scraped, so the InnerTube path still works on its own.
+        if (apiKey.isEmpty()) apiKey = DEFAULT_API_KEY;
+        if (clientVersion.isEmpty()) clientVersion = DEFAULT_CLIENT_VERSION;
 
         String payload = "{"
                 + "\"context\":{\"client\":{"
@@ -207,9 +332,13 @@ final class ExtractorBridge {
                 + "}},"
                 + "\"query\":\"" + jsonEscape(query) + "\""
                 + "}";
+        Map<String, String> headers = new HashMap<>();
+        headers.put("X-YouTube-Client-Name", "1");
+        headers.put("X-YouTube-Client-Version", clientVersion);
         String response = httpPost(
-                "https://www.youtube.com/youtubei/v1/search?key=" + apiKey,
-                payload
+                "https://www.youtube.com/youtubei/v1/search?key=" + apiKey + "&prettyPrint=false",
+                payload,
+                headers
         );
         return parseRendererBlocks(response, tab, query);
     }
@@ -267,6 +396,7 @@ final class ExtractorBridge {
                 "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                         + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        connection.setRequestProperty("Cookie", CONSENT_COOKIE);
         try (InputStream in = connection.getInputStream();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16 * 1024];
@@ -276,7 +406,7 @@ final class ExtractorBridge {
         }
     }
 
-    private static String httpPost(String url, String json) throws Exception {
+    private static String httpPost(String url, String json, Map<String, String> extraHeaders) throws Exception {
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setConnectTimeout(15000);
@@ -289,6 +419,14 @@ final class ExtractorBridge {
                 "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                         + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        connection.setRequestProperty("Cookie", CONSENT_COOKIE);
+        connection.setRequestProperty("Origin", "https://www.youtube.com");
+        connection.setRequestProperty("Referer", "https://www.youtube.com/");
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
+                connection.setRequestProperty(entry.getKey(), entry.getValue());
+            }
+        }
         connection.getOutputStream().write(body);
         InputStream input = connection.getResponseCode() >= 400
                 ? connection.getErrorStream()

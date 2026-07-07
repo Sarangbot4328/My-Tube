@@ -17,6 +17,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
 
@@ -248,9 +249,22 @@ public final class MainActivity extends Activity {
         playerView.setVisibility(View.VISIBLE);
         titleView.setText(data.title);
         statusView.setText(data.uploader == null || data.uploader.isEmpty() ? "재생 중" : data.uploader);
-        player.setMediaItem(MediaItem.fromUri(data.mediaUrl));
+        player.setMediaItem(buildMediaItem(data.mediaUrl));
         player.prepare();
         player.play();
+    }
+
+    // Manifest URLs from YouTube often lack a file extension, so ExoPlayer can't
+    // infer HLS/DASH from the URI alone — set the MIME type explicitly.
+    private MediaItem buildMediaItem(String mediaUrl) {
+        MediaItem.Builder builder = new MediaItem.Builder().setUri(mediaUrl);
+        String lower = mediaUrl.toLowerCase();
+        if (lower.contains(".m3u8") || lower.contains("/hls")) {
+            builder.setMimeType(MimeTypes.APPLICATION_M3U8);
+        } else if (lower.contains(".mpd") || lower.contains("/dash") || lower.contains("manifest")) {
+            builder.setMimeType(MimeTypes.APPLICATION_MPD);
+        }
+        return builder.build();
     }
 
     @Override

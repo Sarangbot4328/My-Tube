@@ -80,6 +80,7 @@ public final class MainActivity extends Activity {
     private LinearLayout downloadScreen;
     private LinearLayout settingsScreen;
     private LinearLayout bottomNav;
+    private TextView downloadStatus;
     private int currentScreen = SCREEN_SEARCH;
 
     // Search screen views.
@@ -159,6 +160,16 @@ public final class MainActivity extends Activity {
         content.addView(downloadScreen);
         content.addView(settingsScreen);
         root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        // Persistent download progress banner (visible across all screens).
+        downloadStatus = new TextView(this);
+        downloadStatus.setVisibility(View.GONE);
+        downloadStatus.setBackgroundColor(Color.rgb(30, 41, 59));
+        downloadStatus.setTextColor(Color.WHITE);
+        downloadStatus.setTextSize(13);
+        downloadStatus.setPadding(dp(16), dp(10), dp(16), dp(10));
+        downloadStatus.setOnClickListener(v -> hideDownloadStatus());
+        root.addView(downloadStatus, new LinearLayout.LayoutParams(-1, -2));
 
         bottomNav = new LinearLayout(this);
         bottomNav.setOrientation(LinearLayout.HORIZONTAL);
@@ -771,23 +782,35 @@ public final class MainActivity extends Activity {
     }
 
     private void startDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
-        Toast.makeText(this, option.muxed
-                ? "고화질 다운로드 중... 합치는 데 시간이 걸릴 수 있어요."
-                : "다운로드를 시작합니다...", Toast.LENGTH_SHORT).show();
+        showDownloadStatus("다운로드 준비 중: " + item.title);
         executor.execute(() -> {
             try {
-                String savedUri = MediaDownloader.save(this, option, item.title);
+                MediaDownloader.ProgressListener listener = status ->
+                        mainHandler.post(() -> showDownloadStatus(status + " · " + item.title));
+                String savedUri = MediaDownloader.save(this, option, item.title, listener);
                 String id = ExtractorBridge.videoIdOf(item.url);
                 if (id.isEmpty()) id = MediaDownloader.safeFileName(item.title, option.ext);
                 DownloadStore.add(this, new DownloadItem(
                         id, item.title, item.subtitle, savedUri, item.thumbnailUrl, option.label));
-                mainHandler.post(() ->
-                        Toast.makeText(this, "다운로드 완료: " + item.title, Toast.LENGTH_LONG).show());
+                mainHandler.post(() -> {
+                    showDownloadStatus("✓ 다운로드 완료: " + item.title);
+                    if (currentScreen == SCREEN_DOWNLOADS) refreshDownloadList();
+                    mainHandler.postDelayed(this::hideDownloadStatus, 5000);
+                });
             } catch (Exception e) {
-                mainHandler.post(() ->
-                        Toast.makeText(this, "다운로드 실패: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                mainHandler.post(() -> showDownloadStatus("✗ 다운로드 실패: " + message));
             }
         });
+    }
+
+    private void showDownloadStatus(String text) {
+        downloadStatus.setText(text);
+        downloadStatus.setVisibility(View.VISIBLE);
+    }
+
+    private void hideDownloadStatus() {
+        downloadStatus.setVisibility(View.GONE);
     }
 
     // ---- Fullscreen / popup ------------------------------------------------

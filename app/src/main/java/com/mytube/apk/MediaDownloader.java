@@ -26,6 +26,10 @@ final class MediaDownloader {
     private static final String USER_AGENT =
             "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)";
 
+    interface ProgressListener {
+        void onProgress(String status);
+    }
+
     private interface StreamWriter {
         void write(OutputStream out) throws Exception;
     }
@@ -33,10 +37,12 @@ final class MediaDownloader {
     private MediaDownloader() {}
 
     // Returns the uri string of the saved file.
-    static String save(Context context, ExtractorBridge.DownloadOption option, String title) throws Exception {
+    static String save(Context context, ExtractorBridge.DownloadOption option, String title,
+                       ProgressListener listener) throws Exception {
         String fileName = safeFileName(title, option.ext);
         if (!option.muxed) {
-            return writeToTarget(context, fileName, "video/mp4", out -> copyUrl(option.videoUrl, out));
+            return writeToTarget(context, fileName, "video/mp4",
+                    out -> copyUrl(option.videoUrl, out, "다운로드 중", listener));
         }
 
         File cache = context.getCacheDir();
@@ -44,15 +50,25 @@ final class MediaDownloader {
         File audioTmp = File.createTempFile("mta", ".m4a", cache);
         File muxed = File.createTempFile("mtmux", ".mp4", cache);
         try {
-            try (OutputStream vo = new FileOutputStream(videoTmp)) { copyUrl(option.videoUrl, vo); }
-            try (OutputStream ao = new FileOutputStream(audioTmp)) { copyUrl(option.audioUrl, ao); }
+            try (OutputStream vo = new FileOutputStream(videoTmp)) {
+                copyUrl(option.videoUrl, vo, "영상 다운로드", listener);
+            }
+            try (OutputStream ao = new FileOutputStream(audioTmp)) {
+                copyUrl(option.audioUrl, ao, "오디오 다운로드", listener);
+            }
+            report(listener, "영상·오디오 합치는 중...");
             muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(), muxed.getAbsolutePath());
+            report(listener, "저장 중...");
             return writeToTarget(context, fileName, "video/mp4", out -> copyFile(muxed, out));
         } finally {
             videoTmp.delete();
             audioTmp.delete();
             muxed.delete();
         }
+    }
+
+    private static void report(ProgressListener listener, String status) {
+        if (listener != null) listener.onProgress(status);
     }
 
     // Writes to the user's chosen folder (SAF) when set, else the app's own
@@ -90,20 +106,45 @@ final class MediaDownloader {
         return Uri.fromFile(file).toString();
     }
 
-    private static void copyUrl(String url, OutputStream out) throws Exception {
+    private static void copyUrl(String url, OutputStream out, String label, ProgressListener listener)
+            throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setInstanceFollowRedirects(true);
         connection.setConnectTimeout(20000);
         connection.setReadTimeout(60000);
         connection.setRequestProperty("User-Agent", USER_AGENT);
-        try (InputStream in = connection.getInputStream()) {
-            byte[] buffer = new byte[64 * 1024];
-            int read;
-            while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
-            out.flush();
+        try {
+            int code = connection.getResponseCode();
+            if (code >= 400) {
+                throw new java.io.IOException("서버 응답 오류 (HTTP " + code + ")");
+            }
+            long total = connection.getContentLengthLong();
+            long done = 0;
+            long lastReport = 0;
+            try (InputStream in = connection.getInputStream()) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                    done += read;
+                    if (listener != null && done - lastReport >= 1024 * 1024) {
+                        lastReport = done;
+                        listener.onProgress(progressText(label, done, total));
+                    }
+                }
+                out.flush();
+            }
         } finally {
             connection.disconnect();
         }
+    }
+
+    private static String progressText(String label, long done, long total) {
+        if (total > 0) {
+            int pct = (int) (done * 100 / total);
+            return label + " " + pct + "% (" + (done / (1024 * 1024)) + "/" + (total / (1024 * 1024)) + "MB)";
+        }
+        return label + " " + (done / (1024 * 1024)) + "MB";
     }
 
     private static void copyFile(File file, OutputStream out) throws Exception {

@@ -2,8 +2,11 @@ package com.mytube.apk;
 
 import org.schabi.newpipe.extractor.Image;
 import org.schabi.newpipe.extractor.InfoItem;
+import org.schabi.newpipe.extractor.ListExtractor;
 import org.schabi.newpipe.extractor.NewPipe;
+import org.schabi.newpipe.extractor.Page;
 import org.schabi.newpipe.extractor.ServiceList;
+import org.schabi.newpipe.extractor.linkhandler.SearchQueryHandler;
 import org.schabi.newpipe.extractor.localization.ContentCountry;
 import org.schabi.newpipe.extractor.localization.Localization;
 import org.schabi.newpipe.extractor.search.SearchInfo;
@@ -44,6 +47,10 @@ final class ExtractorBridge {
     private static final String IOS_USER_AGENT =
             "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)";
 
+    // How many result pages to pull, and the overall cap on returned items.
+    private static final int MAX_SEARCH_PAGES = 5;
+    private static final int MAX_RESULTS = 100;
+
     static synchronized void init() {
         if (initialized) return;
         NewPipe.init(new HttpDownloader(), new Localization("ko", "KR"), new ContentCountry("KR"));
@@ -75,18 +82,37 @@ final class ExtractorBridge {
         List<String> filters = Arrays.asList(tab == MainActivity.Tab.CHANNELS
                 ? YoutubeSearchQueryHandlerFactory.CHANNELS
                 : YoutubeSearchQueryHandlerFactory.VIDEOS);
-        SearchInfo info = SearchInfo.getInfo(ServiceList.YouTube.getSearchExtractor(actualQuery, filters, ""));
+
+        // Keep the query handler so we can page through additional results — a
+        // single page is only ~20 items, far fewer than youtube.com shows.
+        SearchQueryHandler queryHandler =
+                ServiceList.YouTube.getSearchQHFactory().fromQuery(actualQuery, filters, "");
+        SearchInfo info = SearchInfo.getInfo(ServiceList.YouTube.getSearchExtractor(queryHandler));
+
+        List<InfoItem> related = new ArrayList<>(info.getRelatedItems());
+        Page nextPage = info.getNextPage();
+        int page = 1;
+        while (nextPage != null && page < MAX_SEARCH_PAGES && related.size() < MAX_RESULTS) {
+            ListExtractor.InfoItemsPage<InfoItem> more =
+                    SearchInfo.getMoreItems(ServiceList.YouTube, queryHandler, nextPage);
+            related.addAll(more.getItems());
+            nextPage = more.getNextPage();
+            page++;
+        }
+
         List<TubeItem> items = new ArrayList<>();
-        for (InfoItem item : info.getRelatedItems()) {
+        for (InfoItem item : related) {
             if (item instanceof StreamInfoItem) {
                 StreamInfoItem stream = (StreamInfoItem) item;
                 if (tab == MainActivity.Tab.SHORTS && !stream.isShortFormContent()) continue;
                 if (tab == MainActivity.Tab.VIDEOS && stream.isShortFormContent()) continue;
+                String videoId = extractVideoId(stream.getUrl());
+                String thumb = videoId.isEmpty() ? bestImageUrl(stream.getThumbnails()) : youtubeThumbnail(videoId);
                 items.add(new TubeItem(
                         stream.getName(),
                         stream.getUploaderName() + " · " + formatDuration(stream.getDuration()),
                         stream.getUrl(),
-                        bestImageUrl(stream.getThumbnails()),
+                        thumb,
                         true,
                         stream.isShortFormContent()
                 ));
@@ -100,8 +126,17 @@ final class ExtractorBridge {
                         false
                 ));
             }
+            if (items.size() >= MAX_RESULTS) break;
         }
         return items;
+    }
+
+    // Canonical YouTube thumbnail for a video id. hqdefault is always present and,
+    // center-cropped to 16:9 in the UI, matches what youtube.com shows.
+    private static String youtubeThumbnail(String videoId) {
+        return videoId == null || videoId.isEmpty()
+                ? ""
+                : "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg";
     }
 
     static PlaybackData resolve(String url) throws Exception {
@@ -305,11 +340,11 @@ final class ExtractorBridge {
                     title,
                     (channel.isEmpty() ? "YouTube" : channel) + (length.isEmpty() ? "" : " · " + length),
                     "https://www.youtube.com/watch?v=" + id,
-                    bestThumbnailFromBlock(block),
+                    youtubeThumbnail(id),
                     true,
                     tab == MainActivity.Tab.SHORTS
             ));
-            if (items.size() >= 30) break;
+            if (items.size() >= MAX_RESULTS) break;
         }
         return items;
     }
@@ -335,12 +370,40 @@ final class ExtractorBridge {
         Map<String, String> headers = new HashMap<>();
         headers.put("X-YouTube-Client-Name", "1");
         headers.put("X-YouTube-Client-Version", clientVersion);
-        String response = httpPost(
-                "https://www.youtube.com/youtubei/v1/search?key=" + apiKey + "&prettyPrint=false",
-                payload,
-                headers
-        );
-        return parseRendererBlocks(response, tab, query);
+        String url = "https://www.youtube.com/youtubei/v1/search?key=" + apiKey + "&prettyPrint=false";
+        String response = httpPost(url, payload, headers);
+
+        List<TubeItem> items = new ArrayList<>(parseRendererBlocks(response, tab, query));
+
+        // Follow continuation tokens to gather several pages of results.
+        String token = extractContinuationToken(response);
+        int page = 1;
+        while (!token.isEmpty() && page < MAX_SEARCH_PAGES && items.size() < MAX_RESULTS) {
+            String contPayload = "{"
+                    + "\"context\":{\"client\":{"
+                    + "\"clientName\":\"WEB\","
+                    + "\"clientVersion\":\"" + jsonEscape(clientVersion) + "\","
+                    + "\"hl\":\"ko\",\"gl\":\"KR\""
+                    + "}},"
+                    + "\"continuation\":\"" + jsonEscape(token) + "\""
+                    + "}";
+            String contResponse;
+            try {
+                contResponse = httpPost(url, contPayload, headers);
+            } catch (Exception e) {
+                break;
+            }
+            List<TubeItem> more = parseRendererBlocks(contResponse, tab, query);
+            if (more.isEmpty()) break;
+            items.addAll(more);
+            token = extractContinuationToken(contResponse);
+            page++;
+        }
+        return items;
+    }
+
+    private static String extractContinuationToken(String text) {
+        return match(text, "\"continuationCommand\":\\{\"token\":\"([^\"]+)\"");
     }
 
     private static List<TubeItem> parseRendererBlocks(String text, MainActivity.Tab tab, String query) {
@@ -379,11 +442,11 @@ final class ExtractorBridge {
                     title,
                     (channel.isEmpty() ? "YouTube" : channel) + (length.isEmpty() ? "" : " · " + length),
                     "https://www.youtube.com/watch?v=" + id,
-                    bestThumbnailFromBlock(block),
+                    youtubeThumbnail(id),
                     true,
                     shortForm
             ));
-            if (items.size() >= 30) break;
+            if (items.size() >= MAX_RESULTS) break;
         }
         return items;
     }

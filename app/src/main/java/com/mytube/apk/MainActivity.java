@@ -1,6 +1,7 @@
 package com.mytube.apk;
 
 import android.app.Activity;
+import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.os.Handler;
@@ -16,10 +17,12 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
+import androidx.media3.ui.TrackSelectionDialogBuilder;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -42,6 +45,14 @@ public final class MainActivity extends Activity {
     private ExoPlayer player;
     private Tab currentTab = Tab.YOUTUBE;
 
+    // Views hidden while in fullscreen playback.
+    private LinearLayout searchRow;
+    private ScrollView scrollView;
+    private LinearLayout tabsBar;
+    private LinearLayout playerBar;
+    private boolean fullscreen;
+    private boolean playing;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -63,7 +74,7 @@ public final class MainActivity extends Activity {
         titleView.setPadding(dp(16), dp(14), dp(16), dp(8));
         root.addView(titleView, new LinearLayout.LayoutParams(-1, dp(58)));
 
-        LinearLayout searchRow = new LinearLayout(this);
+        searchRow = new LinearLayout(this);
         searchRow.setOrientation(LinearLayout.HORIZONTAL);
         searchRow.setPadding(dp(12), 0, dp(12), dp(8));
 
@@ -93,7 +104,21 @@ public final class MainActivity extends Activity {
         playerView = new PlayerView(this);
         playerView.setPlayer(player);
         playerView.setVisibility(View.GONE);
+        // Enables the controller's fullscreen button and routes taps to us.
+        playerView.setFullscreenButtonClickListener(this::setFullscreen);
         root.addView(playerView, new LinearLayout.LayoutParams(-1, dp(220)));
+
+        playerBar = new LinearLayout(this);
+        playerBar.setOrientation(LinearLayout.HORIZONTAL);
+        playerBar.setGravity(Gravity.END);
+        playerBar.setPadding(dp(12), dp(4), dp(12), 0);
+        playerBar.setVisibility(View.GONE);
+        Button qualityButton = new Button(this);
+        qualityButton.setText("화질");
+        qualityButton.setAllCaps(false);
+        qualityButton.setOnClickListener(v -> showQualityDialog());
+        playerBar.addView(qualityButton, new LinearLayout.LayoutParams(-2, dp(40)));
+        root.addView(playerBar);
 
         statusView = new TextView(this);
         statusView.setTextColor(Color.rgb(71, 85, 105));
@@ -101,22 +126,22 @@ public final class MainActivity extends Activity {
         statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
         root.addView(statusView, new LinearLayout.LayoutParams(-1, dp(42)));
 
-        ScrollView scrollView = new ScrollView(this);
+        scrollView = new ScrollView(this);
         resultsList = new LinearLayout(this);
         resultsList.setOrientation(LinearLayout.VERTICAL);
         resultsList.setPadding(dp(10), 0, dp(10), dp(10));
         scrollView.addView(resultsList);
         root.addView(scrollView, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        LinearLayout tabs = new LinearLayout(this);
-        tabs.setOrientation(LinearLayout.HORIZONTAL);
-        tabs.setBackgroundColor(Color.rgb(11, 15, 20));
-        addTabButton(tabs, "유튜브", Tab.YOUTUBE);
-        addTabButton(tabs, "홈", Tab.HOME);
-        addTabButton(tabs, "동영상", Tab.VIDEOS);
-        addTabButton(tabs, "쇼츠", Tab.SHORTS);
-        addTabButton(tabs, "채널", Tab.CHANNELS);
-        root.addView(tabs, new LinearLayout.LayoutParams(-1, dp(64)));
+        tabsBar = new LinearLayout(this);
+        tabsBar.setOrientation(LinearLayout.HORIZONTAL);
+        tabsBar.setBackgroundColor(Color.rgb(11, 15, 20));
+        addTabButton(tabsBar, "유튜브", Tab.YOUTUBE);
+        addTabButton(tabsBar, "홈", Tab.HOME);
+        addTabButton(tabsBar, "동영상", Tab.VIDEOS);
+        addTabButton(tabsBar, "쇼츠", Tab.SHORTS);
+        addTabButton(tabsBar, "채널", Tab.CHANNELS);
+        root.addView(tabsBar, new LinearLayout.LayoutParams(-1, dp(64)));
 
         return root;
     }
@@ -246,12 +271,70 @@ public final class MainActivity extends Activity {
     }
 
     private void startPlayer(PlaybackData data) {
+        playing = true;
         playerView.setVisibility(View.VISIBLE);
+        playerBar.setVisibility(View.VISIBLE);
         titleView.setText(data.title);
         statusView.setText(data.uploader == null || data.uploader.isEmpty() ? "재생 중" : data.uploader);
         player.setMediaItem(buildMediaItem(data.mediaUrl));
         player.prepare();
         player.play();
+    }
+
+    // Opens a resolution picker for the current stream. Adaptive HLS/DASH streams
+    // expose several qualities here; "자동(Auto)" lets ExoPlayer choose.
+    private void showQualityDialog() {
+        if (!playing) return;
+        try {
+            new TrackSelectionDialogBuilder(this, "화질 선택", player, C.TRACK_TYPE_VIDEO)
+                    .setAllowAdaptiveSelections(true)
+                    .build()
+                    .show();
+        } catch (Exception e) {
+            Toast.makeText(this, "화질 정보를 불러올 수 없습니다.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void setFullscreen(boolean enter) {
+        fullscreen = enter;
+        setRequestedOrientation(enter
+                ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : ActivityInfo.SCREEN_ORIENTATION_USER);
+
+        int chrome = enter ? View.GONE : View.VISIBLE;
+        titleView.setVisibility(chrome);
+        searchRow.setVisibility(chrome);
+        statusView.setVisibility(chrome);
+        scrollView.setVisibility(chrome);
+        tabsBar.setVisibility(chrome);
+        playerBar.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
+
+        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) playerView.getLayoutParams();
+        lp.height = enter ? LinearLayout.LayoutParams.MATCH_PARENT : dp(220);
+        playerView.setLayoutParams(lp);
+
+        applyImmersive(enter);
+    }
+
+    private void applyImmersive(boolean on) {
+        View decor = getWindow().getDecorView();
+        decor.setSystemUiVisibility(on
+                ? View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                : View.SYSTEM_UI_FLAG_VISIBLE);
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (fullscreen) {
+            setFullscreen(false);
+            return;
+        }
+        super.onBackPressed();
     }
 
     // Manifest URLs from YouTube often lack a file extension, so ExoPlayer can't

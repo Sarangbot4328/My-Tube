@@ -18,6 +18,7 @@ import android.text.TextWatcher;
 import android.util.Rational;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
@@ -175,6 +176,12 @@ public final class MainActivity extends Activity {
                 if (playbackState == Player.STATE_ENDED) {
                     maybeAutoPlayNext();
                 }
+                updateKeepScreenOnForPlayer();
+            }
+
+            @Override
+            public void onIsPlayingChanged(boolean isPlaying) {
+                updateKeepScreenOnForPlayer();
             }
         });
         showScreen(SCREEN_SEARCH);
@@ -532,6 +539,7 @@ public final class MainActivity extends Activity {
         resetDefaultQualityForNewMedia();
         player.prepare();
         player.play();
+        updateKeepScreenOnForPlayer();
     }
 
     // ---- Settings screen ---------------------------------------------------
@@ -772,6 +780,7 @@ public final class MainActivity extends Activity {
         }
         if (screen != SCREEN_SEARCH && playing) {
             player.pause();
+            updateKeepScreenOnForPlayer();
         }
         showScreen(screen);
     }
@@ -943,6 +952,7 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 mainHandler.post(() -> {
                     preparingAutoplay = false;
+                    updateKeepScreenOnForPlayer();
                     metaView.setText("재생 실패: " + e.getMessage());
                     Toast.makeText(this, "재생 가능한 스트림을 찾지 못했습니다.", Toast.LENGTH_LONG).show();
                     if (!resetAutoplayHistory) maybeAutoPlayNext();
@@ -961,6 +971,25 @@ public final class MainActivity extends Activity {
         resetDefaultQualityForNewMedia();
         player.prepare();
         player.play();
+        updateKeepScreenOnForPlayer();
+    }
+
+    private void updateKeepScreenOnForPlayer() {
+        int state = player.getPlaybackState();
+        boolean keepOn = preparingAutoplay
+                || (playing
+                && player.getPlayWhenReady()
+                && state != Player.STATE_ENDED
+                && state != Player.STATE_IDLE);
+        setKeepScreenOn(keepOn);
+    }
+
+    private void setKeepScreenOn(boolean keepOn) {
+        if (keepOn) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
     }
 
     private void resetDefaultQualityForNewMedia() {
@@ -1044,6 +1073,7 @@ public final class MainActivity extends Activity {
         TubeItem next = nextAutoplayItem();
         if (next == null) {
             Toast.makeText(this, "재생할 다음 영상이 없습니다.", Toast.LENGTH_SHORT).show();
+            updateKeepScreenOnForPlayer();
             return;
         }
         preparingAutoplay = true;
@@ -1135,6 +1165,7 @@ public final class MainActivity extends Activity {
         preparingAutoplay = false;
         player.pause();
         player.clearMediaItems();
+        setKeepScreenOn(false);
         qualityButton.setText("화질");
         showPlayingLayout(false);
     }
@@ -1327,6 +1358,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        setKeepScreenOn(false);
         player.release();
         executor.shutdownNow();
         super.onDestroy();

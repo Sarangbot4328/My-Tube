@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -356,46 +357,136 @@ final class ExtractorBridge {
         );
     }
 
-    // A downloadable progressive (muxed audio+video) stream for one quality.
+    // A downloadable quality. When muxed==false, videoUrl is a complete progressive
+    // file. When muxed==true, videoUrl (mp4/H.264, video-only) must be combined with
+    // audioUrl (m4a/AAC) into one mp4 — this is how 1080p+ is delivered.
     static final class DownloadOption {
-        final String label;   // e.g. "720p"
-        final String url;
-        final String ext;     // "mp4" / "webm"
+        final String label;      // e.g. "1080p"
+        final String videoUrl;
+        final String audioUrl;   // null for progressive
+        final String ext;        // "mp4" / "webm"
         final String mime;
-        DownloadOption(String label, String url, String ext, String mime) {
+        final boolean muxed;
+        final int height;
+        DownloadOption(String label, String videoUrl, String audioUrl, String ext,
+                       String mime, boolean muxed, int height) {
             this.label = label;
-            this.url = url;
+            this.videoUrl = videoUrl;
+            this.audioUrl = audioUrl;
             this.ext = ext;
             this.mime = mime;
+            this.muxed = muxed;
+            this.height = height;
         }
     }
 
-    // Lists the progressive (single-file) qualities that can be downloaded without
-    // muxing. Adaptive-only videos return an empty list.
+    // Lists downloadable qualities: progressive (single file) plus adaptive mp4
+    // video paired with the best m4a audio for 1080p and above (combined locally
+    // with MediaMuxer). Only mp4/H.264 video is offered for muxing so it remuxes
+    // cleanly into an mp4 container.
     static List<DownloadOption> downloadOptions(String url) throws Exception {
         init();
         String videoId = extractVideoId(url);
         if (videoId.isEmpty()) return new ArrayList<>();
         String response = iosPlayerResponse(videoId);
 
-        List<DownloadOption> options = new ArrayList<>();
-        int start = response.indexOf("\"formats\":[");
-        if (start < 0) return options;
-        start += "\"formats\":[".length();
-        int end = response.indexOf(']', start);
-        if (end < 0) return options;
+        // Height -> option, keeping progressive (needs no muxing) when available.
+        Map<Integer, DownloadOption> byHeight = new LinkedHashMap<>();
 
-        String[] entries = response.substring(start, end).split("\\},\\{");
-        for (String entry : entries) {
-            String streamUrl = cleanUrl(match(entry, "\"url\":\"([^\"]+)\""));
-            if (streamUrl.isEmpty()) continue;   // ciphered stream, not directly usable
-            String mime = clean(match(entry, "\"mimeType\":\"([^\"]+)\""));
-            String label = match(entry, "\"qualityLabel\":\"([^\"]+)\"");
+        for (String obj : jsonArrayObjects(response, "formats")) {
+            String streamUrl = cleanUrl(match(obj, "\"url\":\"([^\"]+)\""));
+            if (streamUrl.isEmpty()) continue;
+            int height = intOf(match(obj, "\"height\":(\\d+)"));
+            String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
             String ext = mime.contains("webm") ? "webm" : "mp4";
-            String cleanMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')) : mime;
-            options.add(new DownloadOption(label.isEmpty() ? "기본 화질" : label, streamUrl, ext, cleanMime));
+            byHeight.put(height, new DownloadOption(
+                    qualityLabel(obj, height), streamUrl, null, ext, "video/mp4", false, height));
         }
+
+        // Best m4a audio track to pair with adaptive video.
+        String bestAudioUrl = "";
+        int bestAudioBitrate = -1;
+        for (String obj : jsonArrayObjects(response, "adaptiveFormats")) {
+            String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
+            if (!mime.startsWith("audio/mp4")) continue;
+            String audioUrl = cleanUrl(match(obj, "\"url\":\"([^\"]+)\""));
+            if (audioUrl.isEmpty()) continue;
+            int bitrate = intOf(match(obj, "\"bitrate\":(\\d+)"));
+            if (bitrate > bestAudioBitrate) {
+                bestAudioBitrate = bitrate;
+                bestAudioUrl = audioUrl;
+            }
+        }
+
+        if (!bestAudioUrl.isEmpty()) {
+            for (String obj : jsonArrayObjects(response, "adaptiveFormats")) {
+                String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
+                // H.264 in mp4 only — MediaMuxer remuxes it cleanly (skip VP9/AV1).
+                if (!mime.startsWith("video/mp4") || !mime.contains("avc1")) continue;
+                String videoUrl = cleanUrl(match(obj, "\"url\":\"([^\"]+)\""));
+                if (videoUrl.isEmpty()) continue;
+                int height = intOf(match(obj, "\"height\":(\\d+)"));
+                if (byHeight.containsKey(height)) continue;    // progressive already covers it
+                byHeight.put(height, new DownloadOption(
+                        qualityLabel(obj, height), videoUrl, bestAudioUrl, "mp4", "video/mp4", true, height));
+            }
+        }
+
+        List<DownloadOption> options = new ArrayList<>(byHeight.values());
+        options.sort((a, b) -> Integer.compare(b.height, a.height));
         return options;
+    }
+
+    private static String qualityLabel(String obj, int height) {
+        String label = match(obj, "\"qualityLabel\":\"([^\"]+)\"");
+        if (!label.isEmpty()) return label;
+        return height > 0 ? height + "p" : "기본 화질";
+    }
+
+    private static int intOf(String value) {
+        if (value == null || value.isEmpty()) return 0;
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    // Extracts each top-level {..} object from the JSON array value of KEY,
+    // correctly handling nested objects/arrays and quoted strings.
+    private static List<String> jsonArrayObjects(String text, String key) {
+        List<String> objects = new ArrayList<>();
+        int keyIndex = text.indexOf("\"" + key + "\":[");
+        if (keyIndex < 0) return objects;
+        int i = keyIndex + key.length() + 4;   // position just after the '['
+        int arrayDepth = 1;
+        int objectDepth = 0;
+        int objectStart = -1;
+        boolean inString = false;
+        boolean escaped = false;
+        for (; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (escaped) { escaped = false; continue; }
+            if (c == '\\') { escaped = true; continue; }
+            if (c == '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (c == '{') {
+                if (objectDepth == 0) objectStart = i;
+                objectDepth++;
+            } else if (c == '}') {
+                objectDepth--;
+                if (objectDepth == 0 && objectStart >= 0) {
+                    objects.add(text.substring(objectStart, i + 1));
+                    objectStart = -1;
+                }
+            } else if (c == '[') {
+                arrayDepth++;
+            } else if (c == ']') {
+                arrayDepth--;
+                if (arrayDepth == 0) break;
+            }
+        }
+        return objects;
     }
 
     private static PlaybackData innerTubeResolve(String url) throws Exception {

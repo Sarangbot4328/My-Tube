@@ -29,6 +29,9 @@ import android.widget.Toast;
 import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.Player;
+import androidx.media3.common.Tracks;
+import androidx.media3.common.VideoSize;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
 import androidx.media3.ui.TrackSelectionDialogBuilder;
@@ -89,6 +92,7 @@ public final class MainActivity extends Activity {
     private PlayerView playerView;
     private LinearLayout playerBar;
     private Button downloadButton;
+    private Button qualityButton;
     private ScrollView metaScroll;
     private TextView metaView;
 
@@ -113,8 +117,26 @@ public final class MainActivity extends Activity {
         imageLoader = new ImageLoader(executor, mainHandler);
         player = new ExoPlayer.Builder(this).build();
         setContentView(buildUi());
+        // Reflect the resolution currently playing on the 화질 button.
+        player.addListener(new Player.Listener() {
+            @Override
+            public void onVideoSizeChanged(VideoSize videoSize) {
+                updateQualityLabel();
+            }
+
+            @Override
+            public void onTracksChanged(Tracks tracks) {
+                updateQualityLabel();
+            }
+        });
         showScreen(SCREEN_SEARCH);
         runSearch();
+    }
+
+    private void updateQualityLabel() {
+        if (qualityButton == null) return;
+        int height = player.getVideoSize().height;
+        qualityButton.setText(height > 0 ? "화질 " + height + "p" : "화질");
     }
 
     private View buildUi() {
@@ -202,7 +224,7 @@ public final class MainActivity extends Activity {
         playerBar.setVisibility(View.GONE);
         addPlayerBarButton("목록", v -> closePlayer());
         addPlayerBarButton("팝업", v -> enterPopup());
-        addPlayerBarButton("화질", v -> showQualityDialog());
+        qualityButton = addPlayerBarButton("화질", v -> showQualityDialog());
         downloadButton = addPlayerBarButton("다운로드", v -> onDownloadClicked());
         screen.addView(playerBar);
 
@@ -696,6 +718,7 @@ public final class MainActivity extends Activity {
         currentItem = null;
         player.pause();
         player.clearMediaItems();
+        qualityButton.setText("화질");
         showPlayingLayout(false);
     }
 
@@ -737,7 +760,10 @@ public final class MainActivity extends Activity {
             return;
         }
         String[] labels = new String[options.size()];
-        for (int i = 0; i < options.size(); i++) labels[i] = options.get(i).label;
+        for (int i = 0; i < options.size(); i++) {
+            ExtractorBridge.DownloadOption o = options.get(i);
+            labels[i] = o.label + (o.muxed ? "  (고화질·합치기)" : "");
+        }
         new AlertDialog.Builder(this)
                 .setTitle("다운로드 화질 선택")
                 .setItems(labels, (d, which) -> startDownload(item, options.get(which)))
@@ -745,13 +771,14 @@ public final class MainActivity extends Activity {
     }
 
     private void startDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
-        Toast.makeText(this, "다운로드를 시작합니다...", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, option.muxed
+                ? "고화질 다운로드 중... 합치는 데 시간이 걸릴 수 있어요."
+                : "다운로드를 시작합니다...", Toast.LENGTH_SHORT).show();
         executor.execute(() -> {
             try {
-                String fileName = MediaDownloader.safeFileName(item.title, option.ext);
-                String savedUri = MediaDownloader.download(this, option.url, fileName, option.mime);
+                String savedUri = MediaDownloader.save(this, option, item.title);
                 String id = ExtractorBridge.videoIdOf(item.url);
-                if (id.isEmpty()) id = fileName;
+                if (id.isEmpty()) id = MediaDownloader.safeFileName(item.title, option.ext);
                 DownloadStore.add(this, new DownloadItem(
                         id, item.title, item.subtitle, savedUri, item.thumbnailUrl, option.label));
                 mainHandler.post(() ->

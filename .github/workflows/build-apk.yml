@@ -1,14 +1,28 @@
 name: Build APK
 
+# Repo layout expected (My-Tube root):
+#   app/  build.gradle  settings.gradle  ...
+# Upload the *contents* of local "My Tube APK" folder to the repo root.
+
 on:
   workflow_dispatch:
   push:
     paths:
-      - "**"
+      - "app/**"
+      - "build.gradle"
+      - "settings.gradle"
+      - "gradle.properties"
+      - ".github/workflows/build-apk.yml"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_KEYSTORE_TYPE: PKCS12
 
     steps:
       - uses: actions/checkout@v4
@@ -27,10 +41,84 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+      - name: Require signing secrets (updateable release APK)
+        id: secrets_check
+        shell: bash
+        run: |
+          missing=0
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Register all 4 secrets (Settings → Secrets and variables → Actions). See SIGNING_SETUP.md"
+            echo "Without them GitHub only produced DEBUG APKs that cannot update each other."
+            exit 1
+          fi
+          echo "All signing secrets are present."
 
-      - uses: actions/upload-artifact@v4
+      - name: Restore release keystore (PKCS12)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/mytube-release.p12"
+          echo "ANDROID_KEYSTORE_PATH=$ANDROID_KEYSTORE_PATH" >> "$GITHUB_ENV"
+          # Decode (handle accidental whitespace/newlines in the secret)
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\r\n\t ' | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          ls -la "$ANDROID_KEYSTORE_PATH"
+          file "$ANDROID_KEYSTORE_PATH" || true
+
+          echo "=== Keystore entries ==="
+          keytool -list -storetype PKCS12 \
+            -keystore "$ANDROID_KEYSTORE_PATH" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" || {
+              echo "::error::Cannot open keystore. Check ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD."
+              exit 1
+            }
+
+          # Resolve alias: prefer secret, else first alias in the store
+          if keytool -list -storetype PKCS12 \
+              -keystore "$ANDROID_KEYSTORE_PATH" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" >/dev/null 2>&1; then
+            echo "Using alias from secret: $ANDROID_KEY_ALIAS"
+          else
+            DETECTED=$(keytool -list -storetype PKCS12 \
+              -keystore "$ANDROID_KEYSTORE_PATH" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              | sed -n 's/^.*alias name: \(.*\)$/\1/ip' | head -n1 | tr -d '\r')
+            if [ -z "$DETECTED" ]; then
+              echo "::error::No alias found in keystore. ANDROID_KEY_ALIAS was: $ANDROID_KEY_ALIAS"
+              exit 1
+            fi
+            echo "::warning::Secret alias '$ANDROID_KEY_ALIAS' not found. Using detected alias: $DETECTED"
+            echo "ANDROID_KEY_ALIAS=$DETECTED" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build signed release APK
+        run: gradle assembleRelease --stacktrace
+
+      - name: Verify APK is signed (not debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          # Fail if it still looks like a debug cert CN
+          CERTS=$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" 2>&1 || true)
+          if echo "$CERTS" | grep -qi "CN=Android Debug"; then
+            echo "::error::APK is still signed with Android Debug key. Release signing did not apply."
+            exit 1
+          fi
+          echo "Release signature OK."
+          cp "$APK" app/build/outputs/apk/release/my-tube.apk
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
         with:
-          name: my-tube-debug-apk
-          path: "app/build/outputs/apk/debug/*.apk"
+          name: my-tube-release-apk
+          path: app/build/outputs/apk/release/my-tube.apk
+          if-no-files-found: error

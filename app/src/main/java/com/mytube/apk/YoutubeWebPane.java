@@ -35,6 +35,8 @@ final class YoutubeWebPane extends LinearLayout {
         void onAdFreePlay(String videoUrl, String pageTitle);
 
         void onDownload(String videoUrl, String pageTitle);
+
+        void onFullscreenChanged(boolean fullscreen);
     }
 
     private static final String HOME = "https://m.youtube.com/";
@@ -52,10 +54,12 @@ final class YoutubeWebPane extends LinearLayout {
     private WebView webView;
     private FrameLayout stage;
     private ProgressBar progressBar;
+    private LinearLayout toolbar;
     private TextView titleView;
     private LinearLayout videoBar;
     private TextView videoLabel;
     private View customFullscreenView;
+    private WebChromeClient.CustomViewCallback customFullscreenCallback;
 
     private String currentUrl = HOME;
     private String currentVideoUrl = "";
@@ -82,7 +86,7 @@ final class YoutubeWebPane extends LinearLayout {
         setBackgroundColor(Color.BLACK);
         setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
 
-        LinearLayout toolbar = new LinearLayout(context);
+        toolbar = new LinearLayout(context);
         toolbar.setOrientation(HORIZONTAL);
         toolbar.setGravity(Gravity.CENTER_VERTICAL);
         toolbar.setBackgroundColor(Color.rgb(15, 15, 15));
@@ -137,7 +141,8 @@ final class YoutubeWebPane extends LinearLayout {
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
-                progressBar.setVisibility(newProgress >= 100 ? GONE : VISIBLE);
+                progressBar.setVisibility(customFullscreenView != null || newProgress >= 100
+                        ? GONE : VISIBLE);
                 progressBar.setProgress(newProgress);
             }
 
@@ -153,17 +158,24 @@ final class YoutubeWebPane extends LinearLayout {
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
                 // YouTube HTML5 fullscreen inside WebView.
-                if (customFullscreenView != null) return;
+                if (customFullscreenView != null) {
+                    callback.onCustomViewHidden();
+                    return;
+                }
                 customFullscreenView = view;
+                customFullscreenCallback = callback;
+                view.setBackgroundColor(Color.BLACK);
                 stage.addView(view, new FrameLayout.LayoutParams(-1, -1));
+                view.bringToFront();
+                toolbar.setVisibility(GONE);
+                progressBar.setVisibility(GONE);
+                videoBar.setVisibility(GONE);
+                if (host != null) host.onFullscreenChanged(true);
             }
 
             @Override
             public void onHideCustomView() {
-                if (customFullscreenView != null) {
-                    stage.removeView(customFullscreenView);
-                    customFullscreenView = null;
-                }
+                hideCustomFullscreen();
             }
         });
         webView.setWebViewClient(new WebViewClient() {
@@ -294,6 +306,7 @@ final class YoutubeWebPane extends LinearLayout {
 
     void destroy() {
         mainHandler.removeCallbacks(urlPoller);
+        exitFullscreen();
         if (webView != null) {
             webView.stopLoading();
             webView.destroy();
@@ -316,6 +329,29 @@ final class YoutubeWebPane extends LinearLayout {
 
     void hideInlinePlayer() {
         // no-op
+    }
+
+    boolean isFullscreen() {
+        return customFullscreenView != null;
+    }
+
+    boolean exitFullscreen() {
+        if (customFullscreenView == null) return false;
+        WebChromeClient.CustomViewCallback callback = customFullscreenCallback;
+        hideCustomFullscreen();
+        if (callback != null) callback.onCustomViewHidden();
+        return true;
+    }
+
+    private void hideCustomFullscreen() {
+        if (customFullscreenView == null) return;
+        stage.removeView(customFullscreenView);
+        customFullscreenView = null;
+        customFullscreenCallback = null;
+        toolbar.setVisibility(VISIBLE);
+        progressBar.setVisibility(GONE);
+        if (!currentVideoUrl.isEmpty()) showVideoBar(currentTitle);
+        if (host != null) host.onFullscreenChanged(false);
     }
 
     private void pollUrlFromJs() {
@@ -361,7 +397,7 @@ final class YoutubeWebPane extends LinearLayout {
     }
 
     private void showVideoBar(String title) {
-        videoBar.setVisibility(VISIBLE);
+        videoBar.setVisibility(customFullscreenView == null ? VISIBLE : GONE);
         videoLabel.setText("영상 · " + (title == null ? "" : title));
     }
 

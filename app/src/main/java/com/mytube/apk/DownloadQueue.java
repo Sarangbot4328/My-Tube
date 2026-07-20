@@ -150,9 +150,7 @@ final class DownloadQueue {
             try {
                 savedUri = MediaDownloader.save(app, option, job.title, progress);
             } catch (Exception first) {
-                String msg = first.getMessage() == null ? "" : first.getMessage();
-                if (msg.contains("403") || msg.contains("429") || msg.toLowerCase().contains("timeout")
-                        || msg.toLowerCase().contains("connect") || msg.toLowerCase().contains("http 5")) {
+                if (MediaDownloader.requiresFreshUrl(first)) {
                     main.post(() -> {
                         if (listener != null) listener.onStatus("스트림 재발급 후 재시도 · " + job.title);
                     });
@@ -177,6 +175,10 @@ final class DownloadQueue {
             });
         } catch (Exception e) {
             String message = e.getMessage() == null ? e.toString() : e.getMessage();
+            if (message.contains("HTTP 429")) {
+                message = "YouTube가 연결을 일시 제한했습니다 (HTTP 429). "
+                        + "잠시 후 다시 시도하거나 로그인 쿠키를 확인하세요.";
+            }
             // Shorten noisy network dumps
             if (message.length() > 180) message = message.substring(0, 180) + "…";
             final String shown = message;

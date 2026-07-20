@@ -18,6 +18,8 @@ import android.text.TextWatcher;
 import android.util.Rational;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
@@ -111,6 +113,7 @@ public final class MainActivity extends Activity {
     private LinearLayout downloadScreen;
     private LinearLayout settingsScreen;
     private LinearLayout bottomNav;
+    private LinearLayout appRoot;
     private TextView downloadStatus;
     private int currentScreen = SCREEN_SEARCH;
 
@@ -162,6 +165,8 @@ public final class MainActivity extends Activity {
     private final Set<String> autoplayPlayedKeys = new HashSet<>();
 
     private boolean fullscreen;
+    private boolean webFullscreen;
+    private boolean restoreDownloadStatusAfterWebFullscreen;
     private boolean playing;
     private boolean offlinePlaying;
     private boolean loadingMore;
@@ -242,13 +247,19 @@ public final class MainActivity extends Activity {
 
     private View buildUi() {
         LinearLayout root = new LinearLayout(this);
+        appRoot = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(248, 249, 251));
         // targetSdk 35 draws edge-to-edge, so pad by the system bar insets to keep
         // the search bar out from under the status bar and the nav out from under
         // the gesture bar.
         root.setOnApplyWindowInsetsListener((v, insets) -> {
-            v.setPadding(0, insets.getSystemWindowInsetTop(), 0, insets.getSystemWindowInsetBottom());
+            if (webFullscreen || fullscreen) {
+                v.setPadding(0, 0, 0, 0);
+            } else {
+                v.setPadding(0, insets.getSystemWindowInsetTop(), 0,
+                        insets.getSystemWindowInsetBottom());
+            }
             return insets;
         });
 
@@ -390,6 +401,10 @@ public final class MainActivity extends Activity {
             @Override
             public void onDownload(String videoUrl, String pageTitle) {
                 downloadWebVideo(videoUrl, pageTitle);
+            }
+            @Override
+            public void onFullscreenChanged(boolean fullscreen) {
+                setWebFullscreen(fullscreen);
             }
         });
         youtubeStage.addView(youtubeWeb, new FrameLayout.LayoutParams(-1, -1));
@@ -1730,10 +1745,16 @@ public final class MainActivity extends Activity {
 
     private void showDownloadStatus(String text) {
         downloadStatus.setText(text);
-        downloadStatus.setVisibility(View.VISIBLE);
+        if (webFullscreen) {
+            restoreDownloadStatusAfterWebFullscreen = true;
+            downloadStatus.setVisibility(View.GONE);
+        } else {
+            downloadStatus.setVisibility(View.VISIBLE);
+        }
     }
 
     private void hideDownloadStatus() {
+        restoreDownloadStatusAfterWebFullscreen = false;
         downloadStatus.setVisibility(View.GONE);
     }
 
@@ -1784,20 +1805,60 @@ public final class MainActivity extends Activity {
         applyImmersive(enter);
     }
 
+    private void setWebFullscreen(boolean enter) {
+        if (webFullscreen == enter) return;
+        webFullscreen = enter;
+        if (enter) {
+            restoreDownloadStatusAfterWebFullscreen = downloadStatus.getVisibility() == View.VISIBLE;
+            downloadStatus.setVisibility(View.GONE);
+        } else if (restoreDownloadStatusAfterWebFullscreen) {
+            downloadStatus.setVisibility(View.VISIBLE);
+        }
+        bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
+        setRequestedOrientation(enter
+                ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : ActivityInfo.SCREEN_ORIENTATION_USER);
+        applyImmersive(enter);
+        if (appRoot != null) appRoot.requestApplyInsets();
+    }
+
     private void applyImmersive(boolean on) {
+        on = on || fullscreen || webFullscreen;
         View decor = getWindow().getDecorView();
-        decor.setSystemUiVisibility(on
-                ? View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                        | View.SYSTEM_UI_FLAG_FULLSCREEN
-                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                : View.SYSTEM_UI_FLAG_VISIBLE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                if (on) {
+                    controller.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                    controller.hide(WindowInsets.Type.systemBars());
+                } else {
+                    controller.show(WindowInsets.Type.systemBars());
+                }
+            }
+        } else {
+            decor.setSystemUiVisibility(on
+                    ? View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    : View.SYSTEM_UI_FLAG_VISIBLE);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && (fullscreen || webFullscreen)) applyImmersive(true);
     }
 
     @Override
     public void onBackPressed() {
+        if (webFullscreen && youtubeWeb != null && youtubeWeb.exitFullscreen()) {
+            return;
+        }
         if (fullscreen) {
             setFullscreen(false);
             return;

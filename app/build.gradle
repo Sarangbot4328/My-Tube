@@ -16,8 +16,8 @@ android {
         applicationId "com.mytube.apk"
         minSdk 26
         targetSdk 35
-        versionCode 8
-        versionName "1.6.1"
+        versionCode 10
+        versionName "1.7"
     }
 
     signingConfigs {
@@ -27,9 +27,8 @@ android {
                 storePassword signingStorePassword
                 keyAlias signingAlias
                 keyPassword signingKeyPassword
-                // PowerShell/OpenSSL PKCS12 (.p12) or JKS both work; default PKCS12
-                // because SIGNING_SETUP / local helper generate .p12.
-                storeType (System.getenv("ANDROID_KEYSTORE_TYPE") ?: "pkcs12")
+                // PowerShell-generated .p12 → PKCS12. Override with ANDROID_KEYSTORE_TYPE=jks if needed.
+                storeType (System.getenv("ANDROID_KEYSTORE_TYPE") ?: "PKCS12")
             }
         }
     }

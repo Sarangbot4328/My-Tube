@@ -17,10 +17,15 @@ final class DownloadStore {
     private static final String KEY_FOLDER_URI = "folder_uri";
     private static final String KEY_NEXT_PLAY_ORDER = "next_play_order";
     private static final String KEY_DEFAULT_QUALITY = "default_quality";
+    private static final String KEY_YOUTUBE_VIEW = "youtube_view_mode";
     static final String ORDER_SEQUENTIAL = "sequential";
     static final String ORDER_RANDOM = "random";
     static final String QUALITY_LOWEST = "lowest";
     static final String QUALITY_HIGHEST = "highest";
+    /** Real YouTube site WebView + bottom ad-free/download bar. */
+    static final String VIEW_WEB = "web";
+    /** Classic in-app search list (NewPipe / InnerTube). */
+    static final String VIEW_LIST = "list";
 
     private DownloadStore() {}
 
@@ -138,6 +143,17 @@ final class DownloadStore {
 
     static void setDefaultQuality(Context c, String quality) {
         prefs(c).edit().putString(KEY_DEFAULT_QUALITY, normalizeQuality(quality)).apply();
+    }
+
+    static String getYoutubeViewMode(Context c) {
+        String mode = prefs(c).getString(KEY_YOUTUBE_VIEW, VIEW_WEB);
+        return VIEW_LIST.equals(mode) ? VIEW_LIST : VIEW_WEB;
+    }
+
+    static void setYoutubeViewMode(Context c, String mode) {
+        prefs(c).edit()
+                .putString(KEY_YOUTUBE_VIEW, VIEW_LIST.equals(mode) ? VIEW_LIST : VIEW_WEB)
+                .apply();
     }
 
     private static String normalizeQuality(String quality) {

@@ -203,7 +203,7 @@ final class YoutubeWebPane extends LinearLayout {
         row.addView(adFree, new LayoutParams(0, dp(48), 1));
 
         Button download = new Button(context);
-        download.setText("다운로드");
+        download.setText("대기열 등록");
         download.setAllCaps(false);
         download.setTextColor(Color.WHITE);
         download.setBackgroundColor(Color.rgb(220, 38, 38));

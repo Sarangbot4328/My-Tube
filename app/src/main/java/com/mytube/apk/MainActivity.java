@@ -114,14 +114,21 @@ public final class MainActivity extends Activity {
     private TextView downloadStatus;
     private int currentScreen = SCREEN_SEARCH;
 
-    // YouTube site (WebView) + ad-free player overlay.
+    // YouTube site (WebView) / list mode + ad-free player overlay.
     private YoutubeWebPane youtubeWeb;
     private FrameLayout youtubeStage;
+    private LinearLayout webModeRoot;
+    private LinearLayout listModeRoot;
     private PlayerView playerView;
     private LinearLayout playerChrome;
+    private LinearLayout playerLayer;
     private TextView playerTitleView;
     private Button qualityButton;
     private Button playerDownloadButton;
+    private Button viewWebButton;
+    private Button viewListButton;
+    private TextView youtubeViewModeText;
+    private DownloadQueue downloadQueue;
 
     // Legacy search UI fields kept nullable for offline helpers (unused in web mode).
     private EditText searchInput;
@@ -167,6 +174,34 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         CookieStore.init(this);
         imageLoader = new ImageLoader(executor, mainHandler);
+        downloadQueue = new DownloadQueue(this);
+        downloadQueue.setListener(new DownloadQueue.Listener() {
+            @Override
+            public void onStatus(String message) {
+                showDownloadStatus(message);
+            }
+
+            @Override
+            public void onQueueChanged(int pending, boolean active) {
+                // keep banner visible while queue works
+            }
+
+            @Override
+            public void onItemCompleted(DownloadItem item) {
+                if (currentScreen == SCREEN_DOWNLOADS) refreshDownloadList();
+                mainHandler.postDelayed(() -> {
+                    if (downloadQueue != null && !downloadQueue.isActive()
+                            && downloadQueue.pendingCount() == 0) {
+                        hideDownloadStatus();
+                    }
+                }, 4000);
+            }
+
+            @Override
+            public void onItemFailed(String title, String error) {
+                showDownloadStatus("✗ " + title + " · " + error);
+            }
+        });
         player = new ExoPlayer.Builder(this).build();
         setContentView(buildUi());
         // Reflect the resolution currently playing on the 화질 button.
@@ -196,7 +231,7 @@ public final class MainActivity extends Activity {
             }
         });
         showScreen(SCREEN_SEARCH);
-        if (youtubeWeb != null) youtubeWeb.start();
+        applyYoutubeViewMode(false);
     }
 
     private void updateQualityLabel() {
@@ -247,45 +282,30 @@ public final class MainActivity extends Activity {
         return root;
     }
 
-    // ---- YouTube site screen (real m.youtube.com) --------------------------
+    // ---- YouTube tab: web site mode OR classic list mode --------------------
 
     private LinearLayout buildSearchScreen() {
+        // Outer shell: two modes stacked + shared ad-free player overlay.
+        FrameLayout shell = new FrameLayout(this);
+        shell.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+        // Wrap in LinearLayout for searchScreen type field (visibility toggling).
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
         screen.setBackgroundColor(Color.BLACK);
+        screen.addView(shell, new LinearLayout.LayoutParams(-1, -1));
 
-        youtubeStage = new FrameLayout(this);
-        youtubeWeb = new YoutubeWebPane(this);
-        youtubeWeb.setHost(new YoutubeWebPane.Host() {
-            @Override
-            public void onVideoDetected(String videoUrl, String pageTitle) {
-                // Bottom bar lives inside YoutubeWebPane; nothing else required.
-            }
+        webModeRoot = buildWebModeRoot();
+        listModeRoot = buildListModeRoot();
+        shell.addView(webModeRoot, new FrameLayout.LayoutParams(-1, -1));
+        shell.addView(listModeRoot, new FrameLayout.LayoutParams(-1, -1));
 
-            @Override
-            public void onNotVideoPage() {
-                // Keep ad-free player if user opened it; otherwise idle.
-            }
-
-            @Override
-            public void onAdFreePlay(String videoUrl, String pageTitle) {
-                playWebVideo(videoUrl, pageTitle);
-            }
-
-            @Override
-            public void onDownload(String videoUrl, String pageTitle) {
-                downloadWebVideo(videoUrl, pageTitle);
-            }
-        });
-        youtubeStage.addView(youtubeWeb, new FrameLayout.LayoutParams(-1, -1));
-
-        // Ad-free ExoPlayer overlay (covers the site while playing).
-        LinearLayout playerLayer = new LinearLayout(this);
+        // Shared player overlay on top of either mode.
+        playerLayer = new LinearLayout(this);
         playerLayer.setOrientation(LinearLayout.VERTICAL);
         playerLayer.setBackgroundColor(Color.BLACK);
         playerLayer.setVisibility(View.GONE);
-        playerLayer.setId(View.generateViewId());
+        playerLayer.setTag("playerLayer");
 
         playerView = new PlayerView(this);
         playerView.setPlayer(player);
@@ -311,7 +331,7 @@ public final class MainActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
 
         Button closePlayer = new Button(this);
-        closePlayer.setText("목록");
+        closePlayer.setText("닫기");
         closePlayer.setAllCaps(false);
         closePlayer.setOnClickListener(v -> closePlayer());
         row.addView(closePlayer, new LinearLayout.LayoutParams(0, dp(46), 1));
@@ -325,7 +345,7 @@ public final class MainActivity extends Activity {
         row.addView(qualityButton, qLp);
 
         playerDownloadButton = new Button(this);
-        playerDownloadButton.setText("다운로드");
+        playerDownloadButton.setText("대기열 등록");
         playerDownloadButton.setAllCaps(false);
         playerDownloadButton.setTextColor(Color.WHITE);
         playerDownloadButton.setBackgroundColor(Color.rgb(220, 38, 38));
@@ -336,39 +356,124 @@ public final class MainActivity extends Activity {
         playerChrome.addView(row, new LinearLayout.LayoutParams(-1, -2));
 
         TextView tip = new TextView(this);
-        tip.setText("광고 없이 재생 중 · 아래 다운로드로 저장할 수 있습니다");
+        tip.setText("광고 없이 재생 · «대기열 등록»으로 순차 다운로드");
         tip.setTextColor(Color.rgb(148, 163, 184));
         tip.setTextSize(11);
         tip.setPadding(0, dp(6), 0, 0);
         playerChrome.addView(tip, new LinearLayout.LayoutParams(-1, -2));
 
         playerLayer.addView(playerChrome, new LinearLayout.LayoutParams(-1, -2));
-        playerLayer.setTag("playerLayer");
-        youtubeStage.addView(playerLayer, new FrameLayout.LayoutParams(-1, -1));
+        shell.addView(playerLayer, new FrameLayout.LayoutParams(-1, -1));
 
-        // Keep references for old helpers that still look for these (hidden/unused).
         downloadButton = playerDownloadButton;
         metaView = playerTitleView;
         metaScroll = null;
         playerBar = playerChrome;
-        searchRow = new LinearLayout(this);
-        sortRow = new LinearLayout(this);
-        statusView = new TextView(this);
-        resultsScroll = new ScrollView(this);
-        resultsList = new LinearLayout(this);
-        searchInput = new EditText(this);
 
-        screen.addView(youtubeStage, new LinearLayout.LayoutParams(-1, 0, 1));
         return screen;
     }
 
-    private View playerLayerView() {
-        if (youtubeStage == null) return null;
-        for (int i = 0; i < youtubeStage.getChildCount(); i++) {
-            View child = youtubeStage.getChildAt(i);
-            if ("playerLayer".equals(child.getTag())) return child;
+    private LinearLayout buildWebModeRoot() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.BLACK);
+
+        youtubeStage = new FrameLayout(this);
+        youtubeWeb = new YoutubeWebPane(this);
+        youtubeWeb.setHost(new YoutubeWebPane.Host() {
+            @Override public void onVideoDetected(String videoUrl, String pageTitle) {}
+            @Override public void onNotVideoPage() {}
+            @Override
+            public void onAdFreePlay(String videoUrl, String pageTitle) {
+                playWebVideo(videoUrl, pageTitle);
+            }
+            @Override
+            public void onDownload(String videoUrl, String pageTitle) {
+                downloadWebVideo(videoUrl, pageTitle);
+            }
+        });
+        youtubeStage.addView(youtubeWeb, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(youtubeStage, new LinearLayout.LayoutParams(-1, -1));
+        return root;
+    }
+
+    private LinearLayout buildListModeRoot() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(Color.rgb(248, 249, 251));
+
+        searchRow = new LinearLayout(this);
+        searchRow.setOrientation(LinearLayout.HORIZONTAL);
+        searchRow.setPadding(dp(12), dp(10), dp(12), dp(8));
+
+        searchInput = new EditText(this);
+        searchInput.setSingleLine(true);
+        searchInput.setHint("검색어 (비우면 추천/인기)");
+        searchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        searchInput.setTextColor(Color.rgb(15, 23, 42));
+        searchInput.setHintTextColor(Color.rgb(100, 116, 139));
+        searchInput.setBackgroundColor(Color.WHITE);
+        searchInput.setPadding(dp(12), 0, dp(12), 0);
+        searchInput.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                runSearch();
+                return true;
+            }
+            return false;
+        });
+        searchRow.addView(searchInput, new LinearLayout.LayoutParams(0, dp(46), 1));
+
+        Button searchButton = new Button(this);
+        searchButton.setText("검색");
+        searchButton.setOnClickListener(v -> runSearch());
+        searchRow.addView(searchButton, new LinearLayout.LayoutParams(dp(78), dp(46)));
+        screen.addView(searchRow);
+
+        sortRow = new LinearLayout(this);
+        sortRow.setOrientation(LinearLayout.HORIZONTAL);
+        sortRow.setPadding(dp(10), 0, dp(10), dp(6));
+        for (SortOption option : SORTS) addSortButton(sortRow, option);
+        screen.addView(sortRow);
+
+        statusView = new TextView(this);
+        statusView.setTextColor(Color.rgb(71, 85, 105));
+        statusView.setTextSize(14);
+        statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
+        screen.addView(statusView, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        resultsScroll = new ScrollView(this);
+        resultsList = new LinearLayout(this);
+        resultsList.setOrientation(LinearLayout.VERTICAL);
+        resultsList.setPadding(dp(10), 0, dp(10), dp(10));
+        resultsScroll.addView(resultsList);
+        resultsScroll.setOnScrollChangeListener((v, sx, sy, osx, osy) -> {
+            View child = resultsScroll.getChildAt(0);
+            if (child == null) return;
+            int remaining = child.getHeight() - (resultsScroll.getHeight() + sy);
+            if (remaining < dp(600)) maybeLoadMore();
+        });
+        screen.addView(resultsScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        return screen;
+    }
+
+    private void applyYoutubeViewMode(boolean fromSettings) {
+        String mode = DownloadStore.getYoutubeViewMode(this);
+        boolean web = DownloadStore.VIEW_WEB.equals(mode);
+        if (webModeRoot != null) webModeRoot.setVisibility(web ? View.VISIBLE : View.GONE);
+        if (listModeRoot != null) listModeRoot.setVisibility(web ? View.GONE : View.VISIBLE);
+        if (web) {
+            if (youtubeWeb != null) youtubeWeb.start();
+        } else {
+            if (youtubeWeb != null) youtubeWeb.onPause();
+            if (fromSettings || (results != null && results.isEmpty())) {
+                runSearch();
+            }
         }
-        return null;
+        refreshYoutubeViewModeUi();
+    }
+
+    private View playerLayerView() {
+        return playerLayer;
     }
 
     private void playWebVideo(String videoUrl, String title) {
@@ -633,11 +738,65 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.6.1");
+        version.setText("버전 My Tube 1.7");
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
         version.setPadding(dp(16), 0, dp(16), dp(10));
         screen.addView(version);
+
+        // YouTube tab view mode
+        TextView viewModeLabel = new TextView(this);
+        viewModeLabel.setText("유튜브 보기 방식");
+        viewModeLabel.setTextColor(Color.rgb(15, 23, 42));
+        viewModeLabel.setTextSize(15);
+        viewModeLabel.setPadding(dp(16), dp(6), dp(16), dp(4));
+        screen.addView(viewModeLabel);
+
+        youtubeViewModeText = new TextView(this);
+        youtubeViewModeText.setTextColor(Color.rgb(71, 85, 105));
+        youtubeViewModeText.setTextSize(13);
+        youtubeViewModeText.setPadding(dp(16), 0, dp(16), dp(8));
+        screen.addView(youtubeViewModeText);
+
+        LinearLayout viewModeRow = new LinearLayout(this);
+        viewModeRow.setOrientation(LinearLayout.HORIZONTAL);
+        viewModeRow.setPadding(dp(12), 0, dp(12), dp(12));
+
+        viewWebButton = new Button(this);
+        viewWebButton.setText("사이트 화면");
+        viewWebButton.setAllCaps(false);
+        viewWebButton.setOnClickListener(v -> setYoutubeViewMode(DownloadStore.VIEW_WEB));
+        viewModeRow.addView(viewWebButton, new LinearLayout.LayoutParams(0, dp(46), 1));
+
+        viewListButton = new Button(this);
+        viewListButton.setText("목록·검색");
+        viewListButton.setAllCaps(false);
+        viewListButton.setOnClickListener(v -> setYoutubeViewMode(DownloadStore.VIEW_LIST));
+        LinearLayout.LayoutParams listBtnLp = new LinearLayout.LayoutParams(0, dp(46), 1);
+        listBtnLp.setMargins(dp(8), 0, 0, 0);
+        viewModeRow.addView(viewListButton, listBtnLp);
+        screen.addView(viewModeRow);
+
+        // Temp cleanup
+        TextView tempLabel = new TextView(this);
+        tempLabel.setText("저장 공간");
+        tempLabel.setTextColor(Color.rgb(15, 23, 42));
+        tempLabel.setTextSize(15);
+        tempLabel.setPadding(dp(16), dp(6), dp(16), dp(4));
+        screen.addView(tempLabel);
+
+        Button clearTemp = new Button(this);
+        clearTemp.setText("임시 파일 제거");
+        clearTemp.setAllCaps(false);
+        clearTemp.setOnClickListener(v -> {
+            int n = MediaDownloader.clearTempFiles(this);
+            Toast.makeText(this,
+                    n > 0 ? "임시 파일 " + n + "개 삭제했습니다." : "삭제할 임시 파일이 없습니다.",
+                    Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams tempLp = new LinearLayout.LayoutParams(-2, dp(46));
+        tempLp.setMargins(dp(16), 0, dp(16), dp(12));
+        screen.addView(clearTemp, tempLp);
 
         // YouTube session cookies — the main reason PC survives large downloads.
         TextView cookieLabel = new TextView(this);
@@ -654,8 +813,8 @@ public final class MainActivity extends Activity {
         screen.addView(cookieStatusText);
 
         TextView cookieHelp = new TextView(this);
-        cookieHelp.setText("로그인하면 유튜브 탭에 실제 YouTube 사이트(내 계정 홈·구독·검색)가 열립니다. "
-                + "영상 페이지에서 하단 «광고없이 재생» / «다운로드»를 쓰세요. 비공개 기기 전용.");
+        cookieHelp.setText("로그인: 차단 완화 + 사이트 화면 모드에서 내 계정 표시. "
+                + "다운로드는 한 번에 하나씩 대기열로 순차 진행됩니다.");
         cookieHelp.setTextColor(Color.rgb(100, 116, 139));
         cookieHelp.setTextSize(12);
         cookieHelp.setPadding(dp(16), 0, dp(16), dp(8));
@@ -809,7 +968,28 @@ public final class MainActivity extends Activity {
         return wrapper;
     }
 
+    private void setYoutubeViewMode(String mode) {
+        DownloadStore.setYoutubeViewMode(this, mode);
+        applyYoutubeViewMode(true);
+        Toast.makeText(this,
+                DownloadStore.VIEW_WEB.equals(mode)
+                        ? "유튜브 탭: 사이트 화면 모드"
+                        : "유튜브 탭: 목록·검색 모드",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private void refreshYoutubeViewModeUi() {
+        if (youtubeViewModeText == null) return;
+        boolean web = DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this));
+        youtubeViewModeText.setText(web
+                ? "사이트 화면: 실제 YouTube + 하단 «광고없이 재생 / 대기열 등록»"
+                : "목록·검색: 앱 안 검색 리스트에서 재생·대기열 등록");
+        if (viewWebButton != null) styleChoiceButton(viewWebButton, web);
+        if (viewListButton != null) styleChoiceButton(viewListButton, !web);
+    }
+
     private void refreshSettings() {
+        refreshYoutubeViewModeUi();
         if (cookieStatusText != null) {
             cookieStatusText.setText(CookieStore.statusText());
             cookieStatusText.setTextColor(CookieStore.hasAuthCookies()
@@ -989,9 +1169,13 @@ public final class MainActivity extends Activity {
 
     private void onNavClicked(int screen) {
         if (screen == SCREEN_SEARCH && currentScreen == SCREEN_SEARCH) {
-            // Re-tapping 유튜브 closes ad-free player and goes YouTube home.
+            // Re-tapping 유튜브 closes player / refreshes current mode.
             closePlayer();
-            if (youtubeWeb != null) youtubeWeb.goHome();
+            if (DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this))) {
+                if (youtubeWeb != null) youtubeWeb.goHome();
+            } else {
+                runSearch();
+            }
         }
         if (screen != SCREEN_SEARCH && playing) {
             player.pause();
@@ -1384,7 +1568,8 @@ public final class MainActivity extends Activity {
         if (show && playerTitleView != null && currentItem != null) {
             playerTitleView.setText(currentItem.title);
         }
-        if (youtubeWeb != null) {
+        if (youtubeWeb != null
+                && DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this))) {
             if (show) youtubeWeb.onPause();
             else youtubeWeb.onResume();
         }
@@ -1444,7 +1629,7 @@ public final class MainActivity extends Activity {
             return;
         }
         final TubeItem item = currentItem;
-        Toast.makeText(this, "화질 정보를 불러오는 중...", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "대기열 등록 준비 중…", Toast.LENGTH_SHORT).show();
         executor.execute(() -> {
             try {
                 List<ExtractorBridge.DownloadOption> options = ExtractorBridge.downloadOptions(item.url);
@@ -1464,64 +1649,43 @@ public final class MainActivity extends Activity {
         String[] labels = new String[options.size()];
         for (int i = 0; i < options.size(); i++) {
             ExtractorBridge.DownloadOption o = options.get(i);
-            labels[i] = o.label + (o.muxed ? "  (고화질·합치기)" : "");
+            labels[i] = o.label + (o.muxed ? "  (고화질·합치기)" : "") + " · 대기열";
         }
         new AlertDialog.Builder(this)
-                .setTitle("다운로드 화질 선택")
-                .setItems(labels, (d, which) -> startDownload(item, options.get(which)))
+                .setTitle("대기열 등록 · 화질 선택")
+                .setItems(labels, (d, which) -> enqueueDownload(item, options.get(which)))
                 .show();
     }
 
-    private void startDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
+    private void enqueueDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
         final PlaybackData downloadMetadata = currentPlaybackData;
-        if (!CookieStore.hasAuthCookies()) {
-            Toast.makeText(this,
-                    "로그인 쿠키가 없습니다. 설정 → YouTube 로그인 후 대량 다운로드를 권장합니다.",
-                    Toast.LENGTH_LONG).show();
+        if (downloadQueue == null) {
+            Toast.makeText(this, "대기열을 초기화하지 못했습니다.", Toast.LENGTH_SHORT).show();
+            return;
         }
-        showDownloadStatus("다운로드 준비 중: " + item.title);
-        executor.execute(() -> {
-            try {
-                MediaDownloader.ProgressListener listener = status ->
-                        mainHandler.post(() -> showDownloadStatus(status + " · " + item.title));
-                ExtractorBridge.DownloadOption active = option;
-                String savedUri;
-                try {
-                    savedUri = MediaDownloader.save(this, active, item.title, listener);
-                } catch (Exception first) {
-                    // Stream URLs expire or get 403; re-resolve like yt-dlp retries.
-                    String msg = first.getMessage() == null ? "" : first.getMessage();
-                    if (!msg.contains("403") && !msg.contains("429") && !msg.toLowerCase().contains("http 5")) {
-                        throw first;
-                    }
-                    mainHandler.post(() -> showDownloadStatus("스트림 재발급 후 재시도 중… · " + item.title));
-                    ExtractorBridge.DownloadOption refreshed =
-                            ExtractorBridge.refreshOption(item.url, active);
-                    if (refreshed == null) throw first;
-                    active = refreshed;
-                    savedUri = MediaDownloader.save(this, active, item.title, listener);
-                }
-                String id = ExtractorBridge.videoIdOf(item.url);
-                if (id.isEmpty()) id = MediaDownloader.safeFileName(item.title, active.ext);
-                DownloadStore.add(this, new DownloadItem(
-                        id, item.title, item.subtitle, savedUri, item.thumbnailUrl, active.label,
-                        buildDownloadSearchText(item, downloadMetadata)));
-                mainHandler.post(() -> {
-                    showDownloadStatus("✓ 다운로드 완료: " + item.title);
-                    if (currentScreen == SCREEN_DOWNLOADS) refreshDownloadList();
-                    mainHandler.postDelayed(this::hideDownloadStatus, 5000);
-                });
-            } catch (Exception e) {
-                String message = e.getMessage() == null ? e.toString() : e.getMessage();
-                if (message.contains("403") || message.contains("429")) {
-                    message += CookieStore.hasAuthCookies()
-                            ? " · 잠시 후 다시 시도하거나 네트워크를 바꿔 보세요."
-                            : " · 설정에서 YouTube 로그인 후 다시 시도하세요.";
-                }
-                final String shown = message;
-                mainHandler.post(() -> showDownloadStatus("✗ 다운로드 실패: " + shown));
-            }
-        });
+        DownloadQueue.Job job = new DownloadQueue.Job(
+                item.url,
+                item.title,
+                item.subtitle,
+                item.thumbnailUrl,
+                buildDownloadSearchText(item, downloadMetadata),
+                option);
+        int pos = downloadQueue.enqueue(job);
+        if (pos == -2) {
+            Toast.makeText(this, "이미 받은 영상입니다.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (pos <= 0) {
+            Toast.makeText(this, "대기열에 넣지 못했습니다.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (pos == 1 && downloadQueue.isActive()) {
+            showDownloadStatus("다운로드 시작 · " + item.title);
+            Toast.makeText(this, "다운로드를 시작합니다.", Toast.LENGTH_SHORT).show();
+        } else {
+            showDownloadStatus("대기열 " + pos + "번 · " + item.title);
+            Toast.makeText(this, "대기열 " + pos + "번에 등록했습니다. (한 개씩 순차 다운로드)", Toast.LENGTH_LONG).show();
+        }
     }
 
     private String buildDownloadSearchText(TubeItem item, PlaybackData data) {
@@ -1640,6 +1804,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         setKeepScreenOn(false);
+        if (downloadQueue != null) downloadQueue.shutdown();
         if (youtubeWeb != null) youtubeWeb.destroy();
         player.release();
         executor.shutdownNow();

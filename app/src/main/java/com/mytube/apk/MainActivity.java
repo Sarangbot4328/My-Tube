@@ -58,6 +58,8 @@ public final class MainActivity extends Activity {
     private static final int SCREEN_DOWNLOADS = 1;
     private static final int SCREEN_SETTINGS = 2;
     private static final int REQUEST_FOLDER = 42;
+    private static final int REQUEST_LOGIN = 43;
+    private static final int REQUEST_COOKIES_FILE = 44;
 
     private static final class SortOption {
         final String label;
@@ -131,6 +133,7 @@ public final class MainActivity extends Activity {
     private TextView downloadEmpty;
     private EditText downloadSearchInput;
     private TextView folderText;
+    private TextView cookieStatusText;
     private TextView nextPlayOrderText;
     private Button sequentialOrderButton;
     private Button randomOrderButton;
@@ -155,6 +158,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        CookieStore.init(this);
         imageLoader = new ImageLoader(executor, mainHandler);
         player = new ExoPlayer.Builder(this).build();
         setContentView(buildUi());
@@ -249,7 +253,7 @@ public final class MainActivity extends Activity {
 
         searchInput = new EditText(this);
         searchInput.setSingleLine(true);
-        searchInput.setHint("검색어를 입력하세요");
+        searchInput.setHint("비우면 맞춤 추천 · 검색어 입력 가능");
         searchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         searchInput.setTextColor(Color.rgb(15, 23, 42));
         searchInput.setHintTextColor(Color.rgb(100, 116, 139));
@@ -558,11 +562,65 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.2");
+        version.setText("버전 My Tube 1.4");
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
-        version.setPadding(dp(16), 0, dp(16), dp(14));
+        version.setPadding(dp(16), 0, dp(16), dp(10));
         screen.addView(version);
+
+        // YouTube session cookies — the main reason PC survives large downloads.
+        TextView cookieLabel = new TextView(this);
+        cookieLabel.setText("YouTube 로그인 (차단 완화)");
+        cookieLabel.setTextColor(Color.rgb(15, 23, 42));
+        cookieLabel.setTextSize(15);
+        cookieLabel.setPadding(dp(16), dp(6), dp(16), dp(4));
+        screen.addView(cookieLabel);
+
+        cookieStatusText = new TextView(this);
+        cookieStatusText.setTextColor(Color.rgb(71, 85, 105));
+        cookieStatusText.setTextSize(13);
+        cookieStatusText.setPadding(dp(16), 0, dp(16), dp(8));
+        screen.addView(cookieStatusText);
+
+        TextView cookieHelp = new TextView(this);
+        cookieHelp.setText("로그인하면 (1) 차단 완화 쿠키 적용, (2) 검색창을 비웠을 때 계정 맞춤 추천 홈을 불러옵니다. "
+                + "비공개 기기에서만 로그인하세요.");
+        cookieHelp.setTextColor(Color.rgb(100, 116, 139));
+        cookieHelp.setTextSize(12);
+        cookieHelp.setPadding(dp(16), 0, dp(16), dp(8));
+        screen.addView(cookieHelp);
+
+        LinearLayout cookieRow = new LinearLayout(this);
+        cookieRow.setOrientation(LinearLayout.HORIZONTAL);
+        cookieRow.setPadding(dp(12), 0, dp(12), dp(6));
+
+        Button loginBtn = new Button(this);
+        loginBtn.setText("로그인");
+        loginBtn.setAllCaps(false);
+        loginBtn.setOnClickListener(v ->
+                startActivityForResult(new Intent(this, YoutubeLoginActivity.class), REQUEST_LOGIN));
+        cookieRow.addView(loginBtn, new LinearLayout.LayoutParams(0, dp(46), 1));
+
+        Button importBtn = new Button(this);
+        importBtn.setText("cookies.txt");
+        importBtn.setAllCaps(false);
+        importBtn.setOnClickListener(v -> pickCookiesFile());
+        LinearLayout.LayoutParams importLp = new LinearLayout.LayoutParams(0, dp(46), 1);
+        importLp.setMargins(dp(8), 0, 0, 0);
+        cookieRow.addView(importBtn, importLp);
+        screen.addView(cookieRow);
+
+        Button clearCookie = new Button(this);
+        clearCookie.setText("로그인 쿠키 삭제");
+        clearCookie.setAllCaps(false);
+        clearCookie.setOnClickListener(v -> {
+            CookieStore.clear();
+            refreshSettings();
+            Toast.makeText(this, "로그인 쿠키를 삭제했습니다.", Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams clearLp = new LinearLayout.LayoutParams(-2, dp(46));
+        clearLp.setMargins(dp(16), 0, dp(16), dp(14));
+        screen.addView(clearCookie, clearLp);
 
         TextView playOrderLabel = new TextView(this);
         playOrderLabel.setText("다음 영상 재생 순서");
@@ -658,10 +716,34 @@ public final class MainActivity extends Activity {
         rp.setMargins(dp(16), 0, dp(16), dp(8));
         screen.addView(reset, rp);
 
-        return screen;
+        // Scroll the long settings page.
+        ScrollView scroll = new ScrollView(this);
+        scroll.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+        scroll.setFillViewport(true);
+        // Re-parent: screen was built as the root; wrap it.
+        LinearLayout wrapper = new LinearLayout(this);
+        wrapper.setOrientation(LinearLayout.VERTICAL);
+        wrapper.setVisibility(View.GONE);
+        wrapper.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+        // Move children already added to screen into a content column inside scroll.
+        // Simpler: rebuild return as scroll containing screen content.
+        // screen is already the content; just put it in scroll and return scroll container.
+        screen.setVisibility(View.VISIBLE);
+        screen.setLayoutParams(new ScrollView.LayoutParams(-1, -2));
+        // Detach screen from any parent first if needed — none yet.
+        scroll.addView(screen);
+        wrapper.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        // Keep settingsScreen reference as the visibility-togglable wrapper.
+        return wrapper;
     }
 
     private void refreshSettings() {
+        if (cookieStatusText != null) {
+            cookieStatusText.setText(CookieStore.statusText());
+            cookieStatusText.setTextColor(CookieStore.hasAuthCookies()
+                    ? Color.rgb(22, 163, 74) : Color.rgb(185, 28, 28));
+        }
+        if (folderText == null) return;
         String folder = DownloadStore.getFolderUri(this);
         if (folder == null || folder.isEmpty()) {
             File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
@@ -671,6 +753,59 @@ public final class MainActivity extends Activity {
         }
         refreshNextPlayOrderUi();
         refreshDefaultQualityUi();
+    }
+
+    private void pickCookiesFile() {
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"text/plain", "text/*", "*/*"});
+            startActivityForResult(intent, REQUEST_COOKIES_FILE);
+        } catch (Exception e) {
+            Toast.makeText(this, "파일 선택을 열 수 없습니다.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void importCookiesFromUri(Uri uri) {
+        executor.execute(() -> {
+            try {
+                StringBuilder sb = new StringBuilder();
+                try (java.io.InputStream in = getContentResolver().openInputStream(uri);
+                     java.io.BufferedReader reader = new java.io.BufferedReader(
+                             new java.io.InputStreamReader(in, java.nio.charset.StandardCharsets.UTF_8))) {
+                    if (in == null) throw new java.io.IOException("파일을 열 수 없습니다.");
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line).append('\n');
+                        if (sb.length() > 2 * 1024 * 1024) {
+                            throw new java.io.IOException("파일이 너무 큽니다.");
+                        }
+                    }
+                }
+                int count = CookieStore.importNetscape(sb.toString());
+                mainHandler.post(() -> {
+                    refreshSettings();
+                    if (count <= 0 || !CookieStore.hasAuthCookies()) {
+                        Toast.makeText(this,
+                                "유효한 YouTube 로그인 쿠키를 찾지 못했습니다.\nPC data/cookies.txt 형식을 사용하세요.",
+                                Toast.LENGTH_LONG).show();
+                    } else {
+                        Toast.makeText(this, "cookies.txt에서 " + count + "개 쿠키를 가져왔습니다.",
+                                Toast.LENGTH_SHORT).show();
+                        if (currentScreen == SCREEN_SEARCH
+                                && searchInput != null
+                                && searchInput.getText().toString().trim().isEmpty()) {
+                            runSearch();
+                        }
+                    }
+                });
+            } catch (Exception e) {
+                String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                mainHandler.post(() ->
+                        Toast.makeText(this, "가져오기 실패: " + msg, Toast.LENGTH_LONG).show());
+            }
+        });
     }
 
     private void addDefaultQualityButton(LinearLayout row, QualityOption option) {
@@ -758,6 +893,19 @@ public final class MainActivity extends Activity {
             DownloadStore.setFolderUri(this, uri.toString());
             refreshSettings();
             Toast.makeText(this, "저장 폴더가 설정되었습니다.", Toast.LENGTH_SHORT).show();
+        } else if (requestCode == REQUEST_LOGIN) {
+            refreshSettings();
+            if (resultCode == RESULT_OK) {
+                Toast.makeText(this, "로그인 세션이 적용되었습니다. 맞춤 추천을 불러옵니다.", Toast.LENGTH_SHORT).show();
+                if (currentScreen == SCREEN_SEARCH
+                        && searchInput != null
+                        && searchInput.getText().toString().trim().isEmpty()) {
+                    runSearch();
+                }
+            }
+        } else if (requestCode == REQUEST_COOKIES_FILE && resultCode == RESULT_OK
+                && data != null && data.getData() != null) {
+            importCookiesFromUri(data.getData());
         }
     }
 
@@ -809,15 +957,26 @@ public final class MainActivity extends Activity {
         autoplayPlayedKeys.clear();
         preparingAutoplay = false;
         resultsList.removeAllViews();
-        statusView.setText("불러오는 중...");
+        final boolean wantHome = query.trim().isEmpty()
+                && currentSort == ExtractorBridge.SortOrder.RELEVANCE;
+        if (wantHome && !CookieStore.hasAuthCookies()) {
+            statusView.setText("맞춤 추천은 로그인이 필요합니다 · 설정에서 YouTube 로그인 후 당겨보세요");
+        } else if (wantHome) {
+            statusView.setText("맞춤 추천 불러오는 중…");
+        } else {
+            statusView.setText("불러오는 중...");
+        }
         loadingMore = true;
         final ExtractorBridge.SortOrder requestedSort = currentSort;
         session = ExtractorBridge.newSearch(query, Tab.YOUTUBE, requestedSort);
         final ExtractorBridge.SearchSession active = session;
+        final boolean homeFeed = active.isHomeFeed();
         executor.execute(() -> {
             try {
                 List<TubeItem> batch = new ArrayList<>(active.loadMore());
-                int target = requestedSort == ExtractorBridge.SortOrder.DATE ? 80 : 25;
+                // Keep first-page fetch modest. Aggressive multi-page pulls (was 80
+                // for DATE) were a major IP-burn source vs PC.
+                int target = homeFeed ? 20 : 25;
                 while (batch.size() < target && active.hasMore()) {
                     List<TubeItem> more = active.loadMore();
                     if (more.isEmpty()) break;
@@ -831,8 +990,11 @@ public final class MainActivity extends Activity {
                 mainHandler.post(() -> {
                     if (token != searchToken) return;
                     loadingMore = false;
-                    statusView.setText("검색 실패: " + e.getMessage());
-                    Toast.makeText(this, "검색에 실패했습니다.", Toast.LENGTH_SHORT).show();
+                    statusView.setText((homeFeed ? "추천 실패: " : "검색 실패: ") + e.getMessage());
+                    Toast.makeText(this,
+                            homeFeed ? "맞춤 추천을 불러오지 못했습니다. 로그인 상태를 확인해 주세요."
+                                    : "검색에 실패했습니다.",
+                            Toast.LENGTH_SHORT).show();
                 });
             }
         });
@@ -862,16 +1024,28 @@ public final class MainActivity extends Activity {
         results.addAll(batch);
         sortCurrentResults();
         renderResults();
+        boolean home = session != null && session.isHomeFeed();
         if (results.isEmpty()) {
-            statusView.setText("결과가 없습니다.");
+            if (home) {
+                statusView.setText("맞춤 추천이 비었습니다. 로그인·네트워크를 확인하거나 검색어를 입력하세요.");
+            } else if (searchInput.getText().toString().trim().isEmpty() && !CookieStore.hasAuthCookies()) {
+                statusView.setText("결과가 없습니다 · 설정에서 로그인하면 맞춤 추천이 표시됩니다.");
+            } else {
+                statusView.setText("결과가 없습니다.");
+            }
         } else {
             boolean more = session != null && session.hasMore();
-            statusView.setText(results.size() + "개 결과" + (more ? " · 아래로 스크롤하면 더 보기" : ""));
+            String label = home
+                    ? results.size() + "개 맞춤 추천"
+                    : results.size() + "개 결과";
+            statusView.setText(label + (more ? " · 아래로 스크롤하면 더 보기" : ""));
         }
         loadingMore = false;
     }
 
     private void sortCurrentResults() {
+        // Home feed order is personalized — don't re-sort by date.
+        if (session != null && session.isHomeFeed()) return;
         if (currentSort == ExtractorBridge.SortOrder.DATE) {
             results.sort((a, b) -> Long.compare(a.publishedAgeSeconds, b.publishedAgeSeconds));
         }
@@ -1220,16 +1394,37 @@ public final class MainActivity extends Activity {
 
     private void startDownload(TubeItem item, ExtractorBridge.DownloadOption option) {
         final PlaybackData downloadMetadata = currentPlaybackData;
+        if (!CookieStore.hasAuthCookies()) {
+            Toast.makeText(this,
+                    "로그인 쿠키가 없습니다. 설정 → YouTube 로그인 후 대량 다운로드를 권장합니다.",
+                    Toast.LENGTH_LONG).show();
+        }
         showDownloadStatus("다운로드 준비 중: " + item.title);
         executor.execute(() -> {
             try {
                 MediaDownloader.ProgressListener listener = status ->
                         mainHandler.post(() -> showDownloadStatus(status + " · " + item.title));
-                String savedUri = MediaDownloader.save(this, option, item.title, listener);
+                ExtractorBridge.DownloadOption active = option;
+                String savedUri;
+                try {
+                    savedUri = MediaDownloader.save(this, active, item.title, listener);
+                } catch (Exception first) {
+                    // Stream URLs expire or get 403; re-resolve like yt-dlp retries.
+                    String msg = first.getMessage() == null ? "" : first.getMessage();
+                    if (!msg.contains("403") && !msg.contains("429") && !msg.toLowerCase().contains("http 5")) {
+                        throw first;
+                    }
+                    mainHandler.post(() -> showDownloadStatus("스트림 재발급 후 재시도 중… · " + item.title));
+                    ExtractorBridge.DownloadOption refreshed =
+                            ExtractorBridge.refreshOption(item.url, active);
+                    if (refreshed == null) throw first;
+                    active = refreshed;
+                    savedUri = MediaDownloader.save(this, active, item.title, listener);
+                }
                 String id = ExtractorBridge.videoIdOf(item.url);
-                if (id.isEmpty()) id = MediaDownloader.safeFileName(item.title, option.ext);
+                if (id.isEmpty()) id = MediaDownloader.safeFileName(item.title, active.ext);
                 DownloadStore.add(this, new DownloadItem(
-                        id, item.title, item.subtitle, savedUri, item.thumbnailUrl, option.label,
+                        id, item.title, item.subtitle, savedUri, item.thumbnailUrl, active.label,
                         buildDownloadSearchText(item, downloadMetadata)));
                 mainHandler.post(() -> {
                     showDownloadStatus("✓ 다운로드 완료: " + item.title);
@@ -1238,7 +1433,13 @@ public final class MainActivity extends Activity {
                 });
             } catch (Exception e) {
                 String message = e.getMessage() == null ? e.toString() : e.getMessage();
-                mainHandler.post(() -> showDownloadStatus("✗ 다운로드 실패: " + message));
+                if (message.contains("403") || message.contains("429")) {
+                    message += CookieStore.hasAuthCookies()
+                            ? " · 잠시 후 다시 시도하거나 네트워크를 바꿔 보세요."
+                            : " · 설정에서 YouTube 로그인 후 다시 시도하세요.";
+                }
+                final String shown = message;
+                mainHandler.post(() -> showDownloadStatus("✗ 다운로드 실패: " + shown));
             }
         });
     }

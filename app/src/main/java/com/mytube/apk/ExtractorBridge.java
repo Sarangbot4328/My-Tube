@@ -29,9 +29,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -42,8 +44,6 @@ final class ExtractorBridge {
     // can't be scraped from the bootstrap HTML.
     private static final String DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
     private static final String DEFAULT_CLIENT_VERSION = "2.20240718.01.00";
-    // Skips YouTube's EU/consent interstitial that otherwise returns an unusable page.
-    private static final String CONSENT_COOKIE = "SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+000";
 
     // iOS InnerTube client — its player response exposes a directly-playable HLS
     // manifest (muxed audio+video) with no JS signature deciphering required.
@@ -74,11 +74,20 @@ final class ExtractorBridge {
 
     static SearchSession newSearch(String query, MainActivity.Tab tab, SortOrder sort) {
         init();
-        String actualQuery = query == null || query.trim().isEmpty() ? defaultQuery(tab) : query.trim();
+        SortOrder order = sort == null ? SortOrder.RELEVANCE : sort;
+        String trimmed = query == null ? "" : query.trim();
+        // Empty query + login + default sort → personalized home (FEwhat_to_watch).
+        // Explicit search text or non-relevance sort still uses search APIs.
+        if (trimmed.isEmpty()
+                && order == SortOrder.RELEVANCE
+                && CookieStore.hasAuthCookies()) {
+            return new SearchSession("", tab, order, true);
+        }
+        String actualQuery = trimmed.isEmpty() ? defaultQuery(tab) : trimmed;
         if (tab == MainActivity.Tab.SHORTS && !actualQuery.toLowerCase().contains("shorts")) {
             actualQuery = actualQuery + " shorts";
         }
-        return new SearchSession(actualQuery, tab, sort == null ? SortOrder.RELEVANCE : sort);
+        return new SearchSession(actualQuery, tab, order, false);
     }
 
     // Holds the cursor for one search so the UI can keep pulling pages as the user
@@ -87,35 +96,45 @@ final class ExtractorBridge {
         private static final int MODE_INIT = 0;
         private static final int MODE_NEWPIPE = 1;
         private static final int MODE_INNERTUBE = 2;
-        private static final int MODE_DONE = 3;
+        private static final int MODE_HOME = 3;
+        private static final int MODE_DONE = 4;
 
-        private final String actualQuery;
+        private String actualQuery;
         private final MainActivity.Tab tab;
         private final SortOrder sort;
+        private boolean homeFeed;
         private int mode = MODE_INIT;
 
         // NewPipe cursor.
         private SearchQueryHandler queryHandler;
         private Page nextPage;
 
-        // InnerTube cursor.
+        // InnerTube cursor (search or home browse).
         private String itUrl;
         private String itClientVersion = "";
+        private String apiKeyCache = "";
         private Map<String, String> itHeaders;
         private String continuationToken = "";
         private String bootstrapHtml = "";
 
-        SearchSession(String actualQuery, MainActivity.Tab tab, SortOrder sort) {
+        SearchSession(String actualQuery, MainActivity.Tab tab, SortOrder sort, boolean homeFeed) {
             this.actualQuery = actualQuery;
             this.tab = tab;
             this.sort = sort;
+            this.homeFeed = homeFeed;
+        }
+
+        /** True when listing the logged-in account's YouTube home recommendations. */
+        boolean isHomeFeed() {
+            return homeFeed;
         }
 
         boolean hasMore() {
             switch (mode) {
                 case MODE_INIT: return true;
                 case MODE_NEWPIPE: return nextPage != null;
-                case MODE_INNERTUBE: return !continuationToken.isEmpty();
+                case MODE_INNERTUBE:
+                case MODE_HOME: return !continuationToken.isEmpty();
                 default: return false;
             }
         }
@@ -124,35 +143,132 @@ final class ExtractorBridge {
         synchronized List<TubeItem> loadMore() throws Exception {
             switch (mode) {
                 case MODE_INIT: return initFetch();
-                case MODE_NEWPIPE: return newPipeNext();
-                case MODE_INNERTUBE: return innerTubeNext();
+                case MODE_NEWPIPE:
+                    RequestPacer.beforeSearchPage();
+                    return newPipeNext();
+                case MODE_INNERTUBE:
+                    RequestPacer.beforeSearchPage();
+                    return innerTubeNext();
+                case MODE_HOME:
+                    RequestPacer.beforeSearchPage();
+                    return homeNext();
                 default: return new ArrayList<>();
             }
         }
 
         private List<TubeItem> initFetch() throws Exception {
+            if (homeFeed) {
+                try {
+                    RequestPacer.beforeSearchPage();
+                    List<TubeItem> home = homeFirst();
+                    if (!home.isEmpty()) {
+                        mode = MODE_HOME;
+                        return home;
+                    }
+                } catch (Exception ignored) {
+                    // fall back to keyword search below
+                }
+                // Login present but home empty/failed — generic popular search.
+                homeFeed = false;
+                actualQuery = defaultQuery(tab);
+                mode = MODE_INIT;
+            }
             // Sorting isn't available through NewPipe, so only use it for the
             // default relevance order; otherwise go straight to InnerTube.
+            // Avoid hammering every fallback immediately — that pattern burns IP
+            // reputation faster than PC's single yt-dlp path.
             if (sort == SortOrder.RELEVANCE) {
                 try {
+                    RequestPacer.beforeSearchPage();
                     List<TubeItem> items = newPipeFirst();
                     if (!items.isEmpty()) { mode = MODE_NEWPIPE; return items; }
                 } catch (Exception ignored) {
-                    // fall through to InnerTube
+                    // fall through to InnerTube after a short gap
+                    RequestPacer.beforeSearchPage();
                 }
             }
             try {
+                RequestPacer.beforeSearchPage();
                 List<TubeItem> items = innerTubeFirst();
                 if (!items.isEmpty()) { mode = MODE_INNERTUBE; return items; }
             } catch (Exception ignored) {
-                // fall through to a one-shot HTML scrape
+                // only scrape HTML as last resort; skip if we already have bootstrap
             }
             mode = MODE_DONE;
+            if (bootstrapHtml != null && !bootstrapHtml.isEmpty()) {
+                try {
+                    return htmlScrape();
+                } catch (Exception ignored) {
+                    return new ArrayList<>();
+                }
+            }
+            return new ArrayList<>();
+        }
+
+        private void ensureWebClient() throws Exception {
+            if (itHeaders != null && itUrl != null && !itClientVersion.isEmpty()) return;
             try {
-                return htmlScrape();
+                bootstrapHtml = httpGet("https://www.youtube.com/");
             } catch (Exception ignored) {
+                bootstrapHtml = "";
+            }
+            String apiKey = match(bootstrapHtml, "\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
+            itClientVersion = match(bootstrapHtml, "\"INNERTUBE_CLIENT_VERSION\":\"([^\"]+)\"");
+            if (apiKey.isEmpty()) apiKey = DEFAULT_API_KEY;
+            if (itClientVersion.isEmpty()) itClientVersion = DEFAULT_CLIENT_VERSION;
+            itHeaders = new HashMap<>();
+            itHeaders.put("X-YouTube-Client-Name", "1");
+            itHeaders.put("X-YouTube-Client-Version", itClientVersion);
+            // itUrl set by caller (search vs browse)
+            this.apiKeyCache = apiKey;
+        }
+
+        private String webClientContextJson() {
+            return "\"context\":{\"client\":{"
+                    + "\"clientName\":\"WEB\","
+                    + "\"clientVersion\":\"" + jsonEscape(itClientVersion) + "\","
+                    + "\"hl\":\"ko\",\"gl\":\"KR\","
+                    + "\"userAgent\":\"" + jsonEscape(HttpDownloader.BROWSER_UA) + "\""
+                    + "},\"user\":{\"lockedSafetyMode\":false}}";
+        }
+
+        private List<TubeItem> homeFirst() throws Exception {
+            ensureWebClient();
+            itUrl = "https://www.youtube.com/youtubei/v1/browse?key="
+                    + apiKeyCache + "&prettyPrint=false";
+            String payload = "{"
+                    + webClientContextJson() + ","
+                    + "\"browseId\":\"FEwhat_to_watch\""
+                    + "}";
+            String response = httpPost(itUrl, payload, itHeaders);
+            List<TubeItem> items = parseFeedItems(response, tab);
+            continuationToken = extractContinuationToken(response);
+            // Home often nests videos sparsely; pull one more page if thin.
+            if (items.size() < 12 && !continuationToken.isEmpty()) {
+                List<TubeItem> more = homeNext();
+                items = mergeDedupe(items, more);
+            }
+            return items;
+        }
+
+        private List<TubeItem> homeNext() throws Exception {
+            if (continuationToken.isEmpty()) { mode = MODE_DONE; return new ArrayList<>(); }
+            String payload = "{"
+                    + webClientContextJson() + ","
+                    + "\"continuation\":\"" + jsonEscape(continuationToken) + "\""
+                    + "}";
+            String response;
+            try {
+                response = httpPost(itUrl, payload, itHeaders);
+            } catch (Exception e) {
+                continuationToken = "";
+                mode = MODE_DONE;
                 return new ArrayList<>();
             }
+            List<TubeItem> items = parseFeedItems(response, tab);
+            continuationToken = extractContinuationToken(response);
+            if (items.isEmpty() && continuationToken.isEmpty()) mode = MODE_DONE;
+            return items;
         }
 
         private List<TubeItem> newPipeFirst() throws Exception {
@@ -174,29 +290,28 @@ final class ExtractorBridge {
         }
 
         private List<TubeItem> innerTubeFirst() throws Exception {
+            ensureWebClient();
+            // Prefer results HTML for key scrape when searching (richer page).
             try {
-                bootstrapHtml = httpGet("https://www.youtube.com/results?search_query="
+                String resultsHtml = httpGet("https://www.youtube.com/results?search_query="
                         + URLEncoder.encode(actualQuery, StandardCharsets.UTF_8.name()));
+                if (resultsHtml != null && !resultsHtml.isEmpty()) bootstrapHtml = resultsHtml;
+                String apiKey = match(bootstrapHtml, "\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
+                String ver = match(bootstrapHtml, "\"INNERTUBE_CLIENT_VERSION\":\"([^\"]+)\"");
+                if (!apiKey.isEmpty()) apiKeyCache = apiKey;
+                if (!ver.isEmpty()) {
+                    itClientVersion = ver;
+                    itHeaders.put("X-YouTube-Client-Version", itClientVersion);
+                }
             } catch (Exception ignored) {
-                bootstrapHtml = "";
+                // keep homepage bootstrap
             }
-            String apiKey = match(bootstrapHtml, "\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
-            itClientVersion = match(bootstrapHtml, "\"INNERTUBE_CLIENT_VERSION\":\"([^\"]+)\"");
-            if (apiKey.isEmpty()) apiKey = DEFAULT_API_KEY;
-            if (itClientVersion.isEmpty()) itClientVersion = DEFAULT_CLIENT_VERSION;
-
-            itHeaders = new HashMap<>();
-            itHeaders.put("X-YouTube-Client-Name", "1");
-            itHeaders.put("X-YouTube-Client-Version", itClientVersion);
-            itUrl = "https://www.youtube.com/youtubei/v1/search?key=" + apiKey + "&prettyPrint=false";
+            itUrl = "https://www.youtube.com/youtubei/v1/search?key="
+                    + apiKeyCache + "&prettyPrint=false";
 
             String params = tab == MainActivity.Tab.CHANNELS ? "EgIQAg==" : sort.videoParams;
             String payload = "{"
-                    + "\"context\":{\"client\":{"
-                    + "\"clientName\":\"WEB\","
-                    + "\"clientVersion\":\"" + jsonEscape(itClientVersion) + "\","
-                    + "\"hl\":\"ko\",\"gl\":\"KR\""
-                    + "}},"
+                    + webClientContextJson() + ","
                     + "\"query\":\"" + jsonEscape(actualQuery) + "\","
                     + "\"params\":\"" + params + "\""
                     + "}";
@@ -210,11 +325,7 @@ final class ExtractorBridge {
         private List<TubeItem> innerTubeNext() throws Exception {
             if (continuationToken.isEmpty()) { mode = MODE_DONE; return new ArrayList<>(); }
             String payload = "{"
-                    + "\"context\":{\"client\":{"
-                    + "\"clientName\":\"WEB\","
-                    + "\"clientVersion\":\"" + jsonEscape(itClientVersion) + "\","
-                    + "\"hl\":\"ko\",\"gl\":\"KR\""
-                    + "}},"
+                    + webClientContextJson() + ","
                     + "\"continuation\":\"" + jsonEscape(continuationToken) + "\""
                     + "}";
             String response;
@@ -365,9 +476,8 @@ final class ExtractorBridge {
     }
 
     private static final String ANDROID_API_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+    // Prefer clients similar to PC yt-dlp HQ_CLIENT_PRIORITY (android_vr / tv first).
     private static final PlayerClient[] PLAYER_CLIENTS = {
-            new PlayerClient("IOS", IOS_CLIENT_VERSION, IOS_API_KEY, IOS_USER_AGENT, "5",
-                    "\"deviceModel\":\"iPhone16,2\","),
             new PlayerClient("ANDROID_VR", "1.60.19", ANDROID_API_KEY,
                     "com.google.android.apps.youtube.vr.oculus/1.60.19 "
                             + "(Linux; U; Android 12L; en_US; Quest 3) gzip", "28",
@@ -375,6 +485,8 @@ final class ExtractorBridge {
             new PlayerClient("TVHTML5", "7.20240724.13.00", DEFAULT_API_KEY,
                     "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/537.36 "
                             + "(KHTML, like Gecko) 76.0.3809.146 TV Safari/537.36", "7", ""),
+            new PlayerClient("IOS", IOS_CLIENT_VERSION, IOS_API_KEY, IOS_USER_AGENT, "5",
+                    "\"deviceModel\":\"iPhone16,2\","),
     };
 
     private static String playerResponse(String videoId, PlayerClient client) throws Exception {
@@ -407,6 +519,7 @@ final class ExtractorBridge {
     // A downloadable quality. When muxed==false, videoUrl is a complete progressive
     // file. When muxed==true, videoUrl (mp4/H.264, video-only) must be combined with
     // audioUrl (m4a/AAC) into one mp4 — this is how 1080p+ is delivered.
+    // userAgent must match the client that issued the stream URL (403 otherwise).
     static final class DownloadOption {
         final String label;      // e.g. "1080p"
         final String videoUrl;
@@ -415,8 +528,9 @@ final class ExtractorBridge {
         final String mime;
         final boolean muxed;
         final int height;
+        final String userAgent;
         DownloadOption(String label, String videoUrl, String audioUrl, String ext,
-                       String mime, boolean muxed, int height) {
+                       String mime, boolean muxed, int height, String userAgent) {
             this.label = label;
             this.videoUrl = videoUrl;
             this.audioUrl = audioUrl;
@@ -424,6 +538,8 @@ final class ExtractorBridge {
             this.mime = mime;
             this.muxed = muxed;
             this.height = height;
+            this.userAgent = userAgent == null || userAgent.isEmpty()
+                    ? HttpDownloader.BROWSER_UA : userAgent;
         }
     }
 
@@ -435,19 +551,38 @@ final class ExtractorBridge {
         init();
         // Prefer NewPipe: it resolves de-throttled, deciphered stream URLs for the
         // same videos we can play (the iOS client omits direct URLs for many official
-        // videos, which is why downloads showed "no qualities"). Fall back to iOS.
+        // videos, which is why downloads showed "no qualities"). Fall back to players.
         try {
+            RequestPacer.beforeApiCall();
             List<DownloadOption> options = newPipeDownloadOptions(url);
             if (!options.isEmpty()) return options;
         } catch (Exception ignored) {
-            // fall through to the iOS client
+            // fall through
         }
-        return iosDownloadOptions(url);
+        return playerDownloadOptions(url);
+    }
+
+    /** Re-resolve a single height after 403 / expired URL (PC-style retry). */
+    static DownloadOption refreshOption(String url, DownloadOption previous) throws Exception {
+        if (previous == null) return null;
+        List<DownloadOption> options = downloadOptions(url);
+        DownloadOption best = null;
+        int bestDiff = Integer.MAX_VALUE;
+        for (DownloadOption o : options) {
+            if (o.height == previous.height && o.muxed == previous.muxed) return o;
+            int diff = Math.abs(o.height - previous.height);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = o;
+            }
+        }
+        return best;
     }
 
     private static List<DownloadOption> newPipeDownloadOptions(String url) throws Exception {
         StreamInfo info = StreamInfo.getInfo(ServiceList.YouTube, url);
         Map<Integer, DownloadOption> byHeight = new LinkedHashMap<>();
+        String ua = HttpDownloader.BROWSER_UA;
 
         // Progressive muxed streams already contain audio + video.
         for (VideoStream vs : info.getVideoStreams()) {
@@ -457,7 +592,7 @@ final class ExtractorBridge {
             int height = parseHeight(vs.getResolution());
             byHeight.put(height, new DownloadOption(
                     resolutionLabel(vs.getResolution(), height), streamUrl, null,
-                    suffixOf(vs.getFormat()), "video/mp4", false, height));
+                    suffixOf(vs.getFormat()), "video/mp4", false, height, ua));
         }
 
         // Best AAC (m4a) audio track to pair with adaptive mp4 video (1080p+).
@@ -477,7 +612,7 @@ final class ExtractorBridge {
                 if (byHeight.containsKey(height)) continue;   // progressive already covers it
                 byHeight.put(height, new DownloadOption(
                         resolutionLabel(vs.getResolution(), height), streamUrl, bestAudio.getContent(),
-                        "mp4", "video/mp4", true, height));
+                        "mp4", "video/mp4", true, height, ua));
             }
         }
 
@@ -503,15 +638,16 @@ final class ExtractorBridge {
         return suffix == null || suffix.isEmpty() ? "mp4" : suffix;
     }
 
-    private static List<DownloadOption> iosDownloadOptions(String url) throws Exception {
+    private static List<DownloadOption> playerDownloadOptions(String url) throws Exception {
         String videoId = extractVideoId(url);
         if (videoId.isEmpty()) return new ArrayList<>();
         // Try each client; use the first that yields downloadable qualities.
         for (PlayerClient client : PLAYER_CLIENTS) {
             try {
+                RequestPacer.beforeApiCall();
                 String response = playerResponse(videoId, client);
                 if (!isPlayable(response)) continue;
-                List<DownloadOption> options = parseDownloadOptions(response);
+                List<DownloadOption> options = parseDownloadOptions(response, client.userAgent);
                 if (!options.isEmpty()) return options;
             } catch (Exception ignored) {
                 // try the next client
@@ -520,7 +656,7 @@ final class ExtractorBridge {
         return new ArrayList<>();
     }
 
-    private static List<DownloadOption> parseDownloadOptions(String response) {
+    private static List<DownloadOption> parseDownloadOptions(String response, String userAgent) {
         // Height -> option, keeping progressive (needs no muxing) when available.
         Map<Integer, DownloadOption> byHeight = new LinkedHashMap<>();
 
@@ -531,7 +667,7 @@ final class ExtractorBridge {
             String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
             String ext = mime.contains("webm") ? "webm" : "mp4";
             byHeight.put(height, new DownloadOption(
-                    qualityLabel(obj, height), streamUrl, null, ext, "video/mp4", false, height));
+                    qualityLabel(obj, height), streamUrl, null, ext, "video/mp4", false, height, userAgent));
         }
 
         // Best m4a audio track to pair with adaptive video.
@@ -559,7 +695,8 @@ final class ExtractorBridge {
                 int height = intOf(match(obj, "\"height\":(\\d+)"));
                 if (byHeight.containsKey(height)) continue;    // progressive already covers it
                 byHeight.put(height, new DownloadOption(
-                        qualityLabel(obj, height), videoUrl, bestAudioUrl, "mp4", "video/mp4", true, height));
+                        qualityLabel(obj, height), videoUrl, bestAudioUrl, "mp4", "video/mp4", true, height,
+                        userAgent));
             }
         }
 
@@ -813,7 +950,93 @@ final class ExtractorBridge {
     }
 
     private static String extractContinuationToken(String text) {
-        return match(text, "\"continuationCommand\":\\{\"token\":\"([^\"]+)\"");
+        if (text == null || text.isEmpty()) return "";
+        String token = match(text, "\"continuationCommand\":\\{\"token\":\"([^\"]+)\"");
+        if (!token.isEmpty()) return token;
+        token = match(text, "\"nextContinuationData\":\\{\"continuation\":\"([^\"]+)\"");
+        if (!token.isEmpty()) return token;
+        token = match(text, "\"continuation\":\\{\"reloadContinuationData\":\\{\"continuation\":\"([^\"]+)\"");
+        if (!token.isEmpty()) return token;
+        // Last resort: long continuation-looking tokens on home feed.
+        Matcher m = Pattern.compile("\"token\":\"([A-Za-z0-9_%\\-]{40,})\"").matcher(text);
+        if (m.find()) return m.group(1);
+        return "";
+    }
+
+    private static List<TubeItem> mergeDedupe(List<TubeItem> first, List<TubeItem> second) {
+        List<TubeItem> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (TubeItem item : first) {
+            String key = item.url == null ? item.title : item.url;
+            if (seen.add(key)) out.add(item);
+        }
+        if (second != null) {
+            for (TubeItem item : second) {
+                String key = item.url == null ? item.title : item.url;
+                if (seen.add(key)) out.add(item);
+            }
+        }
+        return out;
+    }
+
+    /** Home / browse feed: videoRenderer + compact/grid + loose videoId cards. */
+    private static List<TubeItem> parseFeedItems(String text, MainActivity.Tab tab) {
+        List<TubeItem> items = parseRendererBlocks(text, tab, "");
+        items = mergeDedupe(items, parseRendererBlocksByMarker(text, "\"compactVideoRenderer\":{", tab));
+        items = mergeDedupe(items, parseRendererBlocksByMarker(text, "\"gridVideoRenderer\":{", tab));
+        items = mergeDedupe(items, parseRendererBlocksByMarker(text, "\"reelItemRenderer\":{", tab));
+        // Newer lockup cards often only expose videoId + accessibility title.
+        if (items.size() < 8) {
+            items = mergeDedupe(items, parseLockupStyleItems(text));
+        }
+        return items;
+    }
+
+    private static List<TubeItem> parseLockupStyleItems(String text) {
+        List<TubeItem> items = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        Matcher idMatcher = Pattern.compile("\"videoId\":\"([A-Za-z0-9_-]{11})\"").matcher(text);
+        while (idMatcher.find() && items.size() < MAX_RESULTS) {
+            String id = idMatcher.group(1);
+            if (!seen.add(id)) continue;
+            int from = Math.max(0, idMatcher.start() - 400);
+            int to = Math.min(text.length(), idMatcher.end() + 1200);
+            String window = text.substring(from, to);
+            String title = clean(match(window, "\"content\":\"([^\"]{2,120})\""));
+            if (title.isEmpty()) {
+                title = clean(match(window, "\"label\":\"([^\"]{2,120})\""));
+            }
+            if (title.isEmpty()) {
+                title = clean(match(window, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            }
+            if (title.isEmpty() || title.length() < 2) continue;
+            // Skip pure metadata labels.
+            if (title.matches("(?i)\\d+:\\d+.*") || title.contains("조회수") && title.length() < 20) continue;
+            String channel = clean(match(window, "\"shortBylineText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            if (channel.isEmpty()) {
+                channel = clean(match(window, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+            }
+            items.add(new TubeItem(
+                    title,
+                    subtitle(channel, "", ""),
+                    "https://www.youtube.com/watch?v=" + id,
+                    youtubeThumbnail(id),
+                    true,
+                    window.contains("/shorts/"),
+                    Long.MAX_VALUE
+            ));
+        }
+        return items;
+    }
+
+    private static List<TubeItem> parseRendererBlocksByMarker(String text, String marker, MainActivity.Tab tab) {
+        List<TubeItem> items = new ArrayList<>();
+        for (String block : extractJsonObjects(text, marker)) {
+            TubeItem item = videoItemFromBlock(block, tab, "");
+            if (item != null) items.add(item);
+            if (items.size() >= MAX_RESULTS) break;
+        }
+        return items;
     }
 
     private static List<TubeItem> parseRendererBlocks(String text, MainActivity.Tab tab, String query) {
@@ -839,28 +1062,52 @@ final class ExtractorBridge {
         }
 
         for (String block : extractJsonObjects(text, "\"videoRenderer\":{")) {
-            String id = match(block, "\"videoId\":\"([^\"]+)\"");
-            String title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
-            String channel = clean(match(block, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
-            if (channel.isEmpty()) channel = clean(match(block, "\"shortBylineText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
-            String length = clean(match(block, "\"lengthText\":\\{\"simpleText\":\"(.*?)\""));
-            String published = clean(match(block, "\"publishedTimeText\":\\{\"simpleText\":\"(.*?)\""));
-            if (id.isEmpty() || title.isEmpty()) continue;
-            boolean shortForm = tab == MainActivity.Tab.SHORTS || block.contains("\"navigationEndpoint\":{\"commandMetadata\":{\"webCommandMetadata\":{\"url\":\"/shorts/");
-            if (tab == MainActivity.Tab.SHORTS && !shortForm && !query.toLowerCase().contains("short")) continue;
-            if (tab == MainActivity.Tab.VIDEOS && shortForm) continue;
-            items.add(new TubeItem(
-                    title,
-                    subtitle(channel, length, published),
-                    "https://www.youtube.com/watch?v=" + id,
-                    youtubeThumbnail(id),
-                    true,
-                    shortForm,
-                    parseRelativeAgeSeconds(published)
-            ));
+            TubeItem item = videoItemFromBlock(block, tab, query);
+            if (item != null) items.add(item);
             if (items.size() >= MAX_RESULTS) break;
         }
         return items;
+    }
+
+    private static TubeItem videoItemFromBlock(String block, MainActivity.Tab tab, String query) {
+        String id = match(block, "\"videoId\":\"([A-Za-z0-9_-]{11})\"");
+        if (id.isEmpty()) id = match(block, "\"videoId\":\"([^\"]+)\"");
+        String title = clean(match(block, "\"title\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+        if (title.isEmpty()) title = clean(match(block, "\"title\":\\{\"simpleText\":\"(.*?)\""));
+        if (title.isEmpty()) title = clean(match(block, "\"headline\":\\{\"simpleText\":\"(.*?)\""));
+        String channel = clean(match(block, "\"ownerText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+        if (channel.isEmpty()) channel = clean(match(block, "\"shortBylineText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+        if (channel.isEmpty()) channel = clean(match(block, "\"longBylineText\":\\{\"runs\":\\[\\{\"text\":\"(.*?)\""));
+        String length = clean(match(block, "\"lengthText\":\\{\"simpleText\":\"(.*?)\""));
+        if (length.isEmpty()) {
+            length = clean(match(block, "\"simpleText\":\"(\\d{1,2}:\\d{2}(?::\\d{2})?)\""));
+        }
+        String published = clean(match(block, "\"publishedTimeText\":\\{\"simpleText\":\"(.*?)\""));
+        if (id.isEmpty() || title.isEmpty()) return null;
+        boolean shortForm = tab == MainActivity.Tab.SHORTS
+                || block.contains("/shorts/")
+                || block.contains("reelItemRenderer")
+                || markerIsReel(block);
+        if (tab == MainActivity.Tab.SHORTS && !shortForm
+                && query != null && !query.toLowerCase().contains("short")) {
+            return null;
+        }
+        if (tab == MainActivity.Tab.VIDEOS && shortForm) return null;
+        return new TubeItem(
+                title,
+                subtitle(channel, length, published),
+                shortForm
+                        ? "https://www.youtube.com/shorts/" + id
+                        : "https://www.youtube.com/watch?v=" + id,
+                youtubeThumbnail(id),
+                true,
+                shortForm,
+                parseRelativeAgeSeconds(published)
+        );
+    }
+
+    private static boolean markerIsReel(String block) {
+        return block.contains("\"style\":\"REEL\"") || block.contains("\"isReelItem\":true");
     }
 
     private static String subtitle(String channel, String length, String published) {
@@ -924,14 +1171,15 @@ final class ExtractorBridge {
     }
 
     private static String httpGet(String url) throws Exception {
+        RequestPacer.beforeApiCall();
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setConnectTimeout(15000);
         connection.setReadTimeout(30000);
-        connection.setRequestProperty("User-Agent",
-                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                        + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+        connection.setRequestProperty("User-Agent", HttpDownloader.BROWSER_UA);
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
-        connection.setRequestProperty("Cookie", CONSENT_COOKIE);
+        connection.setRequestProperty("Origin", "https://www.youtube.com");
+        connection.setRequestProperty("Referer", "https://www.youtube.com/");
+        CookieStore.applyTo(connection);
         try (InputStream in = connection.getInputStream();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16 * 1024];
@@ -942,6 +1190,7 @@ final class ExtractorBridge {
     }
 
     private static String httpPost(String url, String json, Map<String, String> extraHeaders) throws Exception {
+        RequestPacer.beforeApiCall();
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setConnectTimeout(15000);
@@ -950,18 +1199,19 @@ final class ExtractorBridge {
         connection.setDoOutput(true);
         connection.setFixedLengthStreamingMode(body.length);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        connection.setRequestProperty("User-Agent",
-                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                        + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+        connection.setRequestProperty("User-Agent", HttpDownloader.BROWSER_UA);
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
-        connection.setRequestProperty("Cookie", CONSENT_COOKIE);
         connection.setRequestProperty("Origin", "https://www.youtube.com");
         connection.setRequestProperty("Referer", "https://www.youtube.com/");
+        CookieStore.applyTo(connection);
         if (extraHeaders != null) {
             for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
+                // Keep session Cookie from CookieStore; client UA may override below.
+                if ("Cookie".equalsIgnoreCase(entry.getKey()) && CookieStore.hasAuthCookies()) continue;
                 connection.setRequestProperty(entry.getKey(), entry.getValue());
             }
         }
+        if (CookieStore.hasAuthCookies()) CookieStore.applyTo(connection);
         connection.getOutputStream().write(body);
         InputStream input = connection.getResponseCode() >= 400
                 ? connection.getErrorStream()

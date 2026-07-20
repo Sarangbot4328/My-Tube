@@ -13,21 +13,16 @@ import androidx.documentfile.provider.DocumentFile;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 
 // Saves a chosen quality to local storage. Progressive streams are written
 // straight to disk; adaptive (1080p+) qualities download the mp4 video and m4a
 // audio separately and combine them with the OS MediaMuxer (no ffmpeg needed).
 final class MediaDownloader {
-    private static final String USER_AGENT =
-            "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)";
-
     interface ProgressListener {
         void onProgress(String status);
     }
@@ -41,16 +36,18 @@ final class MediaDownloader {
     // Returns the uri string of the saved file.
     static String save(Context context, ExtractorBridge.DownloadOption option, String title,
                        ProgressListener listener) throws Exception {
+        RequestPacer.beforeDownload();
         String fileName = safeFileName(title, option.ext);
         File cache = context.getCacheDir();
 
         if (!option.muxed) {
             File tmp = File.createTempFile("mtp", ".tmp", cache);
             try {
-                downloadToFile(option.videoUrl, tmp, "다운로드", listener);
+                downloadToFile(option.videoUrl, option.userAgent, tmp, "다운로드", listener);
                 report(listener, "저장 중...");
                 return writeToTarget(context, fileName, "video/mp4", out -> copyFile(tmp, out));
             } finally {
+                //noinspection ResultOfMethodCallIgnored
                 tmp.delete();
             }
         }
@@ -59,15 +56,18 @@ final class MediaDownloader {
         File audioTmp = File.createTempFile("mta", ".m4a", cache);
         File muxed = File.createTempFile("mtmux", ".mp4", cache);
         try {
-            downloadToFile(option.videoUrl, videoTmp, "영상 다운로드", listener);
-            downloadToFile(option.audioUrl, audioTmp, "오디오 다운로드", listener);
+            downloadToFile(option.videoUrl, option.userAgent, videoTmp, "영상 다운로드", listener);
+            downloadToFile(option.audioUrl, option.userAgent, audioTmp, "오디오 다운로드", listener);
             report(listener, "영상·오디오 합치는 중...");
             muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(), muxed.getAbsolutePath());
             report(listener, "저장 중...");
             return writeToTarget(context, fileName, "video/mp4", out -> copyFile(muxed, out));
         } finally {
+            //noinspection ResultOfMethodCallIgnored
             videoTmp.delete();
+            //noinspection ResultOfMethodCallIgnored
             audioTmp.delete();
+            //noinspection ResultOfMethodCallIgnored
             muxed.delete();
         }
     }
@@ -79,11 +79,38 @@ final class MediaDownloader {
     // Downloads a URL into dest using one sequential connection. This is slower
     // than chunked Range fetching, but looks much closer to ordinary playback
     // traffic and greatly reduces short-burst request volume.
-    private static void downloadToFile(String url, File dest, String label, ProgressListener listener)
-            throws Exception {
-        try (OutputStream out = new FileOutputStream(dest)) {
-            copyUrlSingle(url, out, label, listener);
+    private static void downloadToFile(String url, String userAgent, File dest, String label,
+                                       ProgressListener listener) throws Exception {
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try (OutputStream out = new FileOutputStream(dest)) {
+                copyUrlSingle(url, userAgent, out, label, listener);
+                return;
+            } catch (Exception e) {
+                last = e;
+                if (!isRetryable(e) || attempt == 3) break;
+                report(listener, "재시도 " + attempt + "/3…");
+                try {
+                    Thread.sleep(800L * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
         }
+        throw last == null ? new java.io.IOException("다운로드 실패") : last;
+    }
+
+    private static boolean isRetryable(Exception e) {
+        String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+        return msg.contains("http 403")
+                || msg.contains("http 429")
+                || msg.contains("http 5")
+                || msg.contains("timeout")
+                || msg.contains("timed out")
+                || msg.contains("connection")
+                || msg.contains("reset")
+                || msg.contains("eof");
     }
 
     // Writes to the user's chosen folder (SAF) when set, else the app's own
@@ -121,13 +148,19 @@ final class MediaDownloader {
         return Uri.fromFile(file).toString();
     }
 
-    private static void copyUrlSingle(String url, OutputStream out, String label, ProgressListener listener)
-            throws Exception {
+    private static void copyUrlSingle(String url, String userAgent, OutputStream out, String label,
+                                      ProgressListener listener) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setInstanceFollowRedirects(true);
         connection.setConnectTimeout(20000);
         connection.setReadTimeout(60000);
-        connection.setRequestProperty("User-Agent", USER_AGENT);
+        connection.setRequestProperty("User-Agent",
+                userAgent == null || userAgent.isEmpty() ? HttpDownloader.BROWSER_UA : userAgent);
+        connection.setRequestProperty("Accept", "*/*");
+        connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        connection.setRequestProperty("Origin", "https://www.youtube.com");
+        connection.setRequestProperty("Referer", "https://www.youtube.com/");
+        CookieStore.applyTo(connection);
         try {
             int code = connection.getResponseCode();
             if (code >= 400) {

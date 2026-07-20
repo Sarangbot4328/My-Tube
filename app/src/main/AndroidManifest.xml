@@ -17,5 +17,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".YoutubeLoginActivity"
+            android:exported="false"
+            android:configChanges="keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize"
+            android:label="YouTube 로그인" />
     </application>
 </manifest>

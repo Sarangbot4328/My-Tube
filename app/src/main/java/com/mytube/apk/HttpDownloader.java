@@ -17,26 +17,39 @@ import java.util.List;
 import java.util.Map;
 
 public final class HttpDownloader extends Downloader {
-    private static final String USER_AGENT =
+    static final String BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                    + "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
+                    + "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
     @Override
     public Response execute(Request request) throws IOException, ReCaptchaException {
+        RequestPacer.beforeApiCall();
         HttpURLConnection connection = (HttpURLConnection) new URL(request.url()).openConnection();
         connection.setInstanceFollowRedirects(true);
         connection.setConnectTimeout(15000);
         connection.setReadTimeout(30000);
         connection.setRequestMethod(request.httpMethod());
-        connection.setRequestProperty("User-Agent", USER_AGENT);
+        connection.setRequestProperty("User-Agent", BROWSER_UA);
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        connection.setRequestProperty("Origin", "https://www.youtube.com");
+        connection.setRequestProperty("Referer", "https://www.youtube.com/");
+        CookieStore.applyTo(connection);
 
         Map<String, List<String>> headers = request.headers();
         if (headers != null) {
             for (Map.Entry<String, List<String>> entry : headers.entrySet()) {
                 if (entry.getKey() == null || entry.getValue() == null) continue;
+                // Prefer our session Cookie over NewPipe's empty/consent-only value.
+                if ("Cookie".equalsIgnoreCase(entry.getKey()) && CookieStore.hasAuthCookies()) {
+                    continue;
+                }
                 connection.setRequestProperty(entry.getKey(), String.join(",", entry.getValue()));
             }
+        }
+
+        // Ensure consent/login cookie wins even if a library header overwrote it.
+        if (CookieStore.hasAuthCookies()) {
+            CookieStore.applyTo(connection);
         }
 
         byte[] body = request.dataToSend();

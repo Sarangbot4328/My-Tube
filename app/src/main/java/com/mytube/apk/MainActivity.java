@@ -633,7 +633,7 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.6");
+        version.setText("버전 My Tube 1.6.1");
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
         version.setPadding(dp(16), 0, dp(16), dp(10));
@@ -687,7 +687,8 @@ public final class MainActivity extends Activity {
         clearCookie.setOnClickListener(v -> {
             CookieStore.clear();
             refreshSettings();
-            Toast.makeText(this, "로그인 쿠키를 삭제했습니다.", Toast.LENGTH_SHORT).show();
+            if (youtubeWeb != null) youtubeWeb.goHome();
+            Toast.makeText(this, "쿠키 삭제 · 유튜브를 손님 모드로 다시 엽니다.", Toast.LENGTH_SHORT).show();
         });
         LinearLayout.LayoutParams clearLp = new LinearLayout.LayoutParams(-2, dp(46));
         clearLp.setMargins(dp(16), 0, dp(16), dp(14));
@@ -964,8 +965,8 @@ public final class MainActivity extends Activity {
         } else if (requestCode == REQUEST_LOGIN) {
             refreshSettings();
             if (resultCode == RESULT_OK) {
-                Toast.makeText(this, "로그인 적용 · 유튜브 사이트를 다시 불러옵니다.", Toast.LENGTH_SHORT).show();
-                CookieStore.pushToWebView();
+                Toast.makeText(this, "로그인 적용 · 유튜브 홈을 엽니다.", Toast.LENGTH_SHORT).show();
+                // CookieManager already holds the live session from login WebView.
                 if (youtubeWeb != null) youtubeWeb.reloadWithCookies();
             }
         } else if (requestCode == REQUEST_COOKIES_FILE && resultCode == RESULT_OK

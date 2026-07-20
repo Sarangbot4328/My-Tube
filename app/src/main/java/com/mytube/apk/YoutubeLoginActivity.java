@@ -109,6 +109,7 @@ public final class YoutubeLoginActivity extends Activity {
     }
 
     private void saveCookies() {
+        // Keep WebView CookieManager as-is (already logged in). Only snapshot for HTTP downloads.
         int count = CookieStore.importFromWebView();
         if (count <= 0 || !CookieStore.hasAuthCookies()) {
             Toast.makeText(this,
@@ -116,7 +117,8 @@ public final class YoutubeLoginActivity extends Activity {
                     Toast.LENGTH_LONG).show();
             return;
         }
-        Toast.makeText(this, "로그인 쿠키를 저장했습니다. (" + count + "개)", Toast.LENGTH_SHORT).show();
+        // Do NOT rewrite CookieManager here — overwriting causes YouTube cookie errors.
+        Toast.makeText(this, "로그인 저장됨. 유튜브 탭에서 내 계정으로 이용하세요.", Toast.LENGTH_SHORT).show();
         setResult(RESULT_OK);
         finish();
     }

@@ -10,7 +10,6 @@ import android.util.AttributeSet;
 import android.view.Gravity;
 import android.view.View;
 import android.webkit.CookieManager;
-import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -24,7 +23,7 @@ import android.widget.TextView;
 
 /**
  * Real YouTube site (m.youtube.com) inside a WebView. Detects watch/shorts pages
- * and exposes a bottom action bar for ad-free play + download via the host.
+ * and shows a single native bottom bar for ad-free play + download.
  */
 final class YoutubeWebPane extends LinearLayout {
     interface Host {
@@ -40,6 +39,14 @@ final class YoutubeWebPane extends LinearLayout {
     private static final String HOME = "https://m.youtube.com/";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable urlPoller = new Runnable() {
+        @Override
+        public void run() {
+            pollUrlFromJs();
+            mainHandler.postDelayed(this, 900);
+        }
+    };
+
     private Host host;
     private WebView webView;
     private ProgressBar progressBar;
@@ -49,7 +56,7 @@ final class YoutubeWebPane extends LinearLayout {
     private String currentUrl = HOME;
     private String currentVideoUrl = "";
     private String currentTitle = "";
-    private boolean videoBarVisible;
+    private boolean started;
 
     public YoutubeWebPane(Context context) {
         super(context);
@@ -65,13 +72,12 @@ final class YoutubeWebPane extends LinearLayout {
         this.host = host;
     }
 
-    @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+    @SuppressLint("SetJavaScriptEnabled")
     private void init(Context context) {
         setOrientation(VERTICAL);
         setBackgroundColor(Color.BLACK);
         setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
 
-        // Top chrome
         LinearLayout toolbar = new LinearLayout(context);
         toolbar.setOrientation(HORIZONTAL);
         toolbar.setGravity(Gravity.CENTER_VERTICAL);
@@ -123,6 +129,7 @@ final class YoutubeWebPane extends LinearLayout {
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
         cookieManager.setAcceptThirdPartyCookies(webView, true);
+
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
@@ -135,12 +142,16 @@ final class YoutubeWebPane extends LinearLayout {
                 if (title != null && !title.isEmpty()) {
                     currentTitle = title.replace(" - YouTube", "").trim();
                     titleView.setText(currentTitle);
+                    if (!currentVideoUrl.isEmpty()) showVideoBar(currentTitle);
                 }
             }
         });
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                if (request != null && request.getUrl() != null) {
+                    onUrlMaybeVideo(request.getUrl().toString(), false);
+                }
                 return false;
             }
 
@@ -155,14 +166,14 @@ final class YoutubeWebPane extends LinearLayout {
                 currentUrl = url == null ? "" : url;
                 onUrlMaybeVideo(currentUrl, true);
                 injectAdShield();
-                injectDownloadHook();
+                // Remove leftover FAB from older builds if still in page cache.
+                removeLegacyDownloadFab();
             }
         });
-        webView.addJavascriptInterface(new JsBridge(), "MyTube");
         stage.addView(webView, new FrameLayout.LayoutParams(-1, -1));
         addView(stage, new LayoutParams(-1, 0, 1));
 
-        // Bottom bar on video pages
+        // Single bottom action bar (native) — no in-page download button.
         videoBar = new LinearLayout(context);
         videoBar.setOrientation(VERTICAL);
         videoBar.setBackgroundColor(Color.rgb(24, 24, 24));
@@ -221,19 +232,29 @@ final class YoutubeWebPane extends LinearLayout {
     }
 
     void start() {
+        if (started && webView != null && webView.getUrl() != null) {
+            CookieStore.pushToWebView();
+            return;
+        }
+        started = true;
         CookieStore.pushToWebView();
         if (webView != null) webView.loadUrl(HOME);
+        mainHandler.removeCallbacks(urlPoller);
+        mainHandler.postDelayed(urlPoller, 1000);
     }
 
     void reloadWithCookies() {
+        // After login: CookieManager already has the session — do not corrupt it.
         CookieStore.pushToWebView();
-        if (webView != null) webView.reload();
+        if (webView != null) {
+            webView.loadUrl(HOME);
+        }
     }
 
     void goHome() {
         CookieStore.pushToWebView();
         if (webView != null) webView.loadUrl(HOME);
-        hideVideoBar();
+        applyVideoState("", HOME);
     }
 
     boolean canGoBack() {
@@ -245,14 +266,18 @@ final class YoutubeWebPane extends LinearLayout {
     }
 
     void onPause() {
+        mainHandler.removeCallbacks(urlPoller);
         if (webView != null) webView.onPause();
     }
 
     void onResume() {
         if (webView != null) webView.onResume();
+        mainHandler.removeCallbacks(urlPoller);
+        mainHandler.postDelayed(urlPoller, 500);
     }
 
     void destroy() {
+        mainHandler.removeCallbacks(urlPoller);
         if (webView != null) {
             webView.stopLoading();
             webView.destroy();
@@ -268,21 +293,24 @@ final class YoutubeWebPane extends LinearLayout {
         return currentTitle;
     }
 
+    private void pollUrlFromJs() {
+        if (webView == null) return;
+        webView.evaluateJavascript(
+                "(function(){try{return location.href}catch(e){return ''}})()",
+                value -> {
+                    String href = stripJsString(value);
+                    if (href.isEmpty()) return;
+                    mainHandler.post(() -> onUrlMaybeVideo(href, true));
+                });
+    }
+
     private void onUrlMaybeVideo(String url, boolean finished) {
+        if (url == null) url = "";
+        currentUrl = url;
         String videoUrl = normalizeVideoUrl(url);
-        if (videoUrl.isEmpty()) {
-            // Also check for /watch or /shorts in SPA without full reload
-            if (finished && webView != null) {
-                webView.evaluateJavascript(
-                        "(function(){return location.href})()",
-                        value -> {
-                            String href = stripJsString(value);
-                            String v = normalizeVideoUrl(href);
-                            mainHandler.post(() -> applyVideoState(v, href));
-                        });
-            } else {
-                applyVideoState("", url);
-            }
+        if (videoUrl.isEmpty() && finished && webView != null) {
+            // SPA: path may lag; poll handles most cases.
+            applyVideoState("", url);
             return;
         }
         applyVideoState(videoUrl, url);
@@ -290,25 +318,30 @@ final class YoutubeWebPane extends LinearLayout {
 
     private void applyVideoState(String videoUrl, String pageUrl) {
         if (videoUrl == null || videoUrl.isEmpty()) {
-            currentVideoUrl = "";
-            hideVideoBar();
-            if (host != null) host.onNotVideoPage();
+            if (!currentVideoUrl.isEmpty()) {
+                currentVideoUrl = "";
+                hideVideoBar();
+                if (host != null) host.onNotVideoPage();
+            } else {
+                hideVideoBar();
+            }
             return;
         }
+        boolean changed = !videoUrl.equals(currentVideoUrl);
         currentVideoUrl = videoUrl;
-        if (currentTitle.isEmpty()) currentTitle = "YouTube 영상";
+        if (currentTitle.isEmpty() || "YouTube".equals(currentTitle)) {
+            currentTitle = "YouTube 영상";
+        }
         showVideoBar(currentTitle);
-        if (host != null) host.onVideoDetected(videoUrl, currentTitle);
+        if (changed && host != null) host.onVideoDetected(videoUrl, currentTitle);
     }
 
     private void showVideoBar(String title) {
-        videoBarVisible = true;
         videoBar.setVisibility(VISIBLE);
         videoLabel.setText("영상 · " + (title == null ? "" : title));
     }
 
     private void hideVideoBar() {
-        videoBarVisible = false;
         videoBar.setVisibility(GONE);
     }
 
@@ -319,7 +352,7 @@ final class YoutubeWebPane extends LinearLayout {
                 + "var css='ytd-ad-slot-renderer,.ytp-ad-module,.video-ads,"
                 + ".ytp-ad-player-overlay,.ytp-ad-overlay-container,"
                 + "ytd-promoted-sparkles-web-renderer,ytd-display-ad-renderer,"
-                + "ytd-ad-slot-renderer,#player-ads,.ad-container,"
+                + "#player-ads,.ad-container,"
                 + "ytm-promoted-sparkles-text-search-renderer,"
                 + "ytm-promoted-sparkles-web-renderer{display:none!important;height:0!important}';"
                 + "if(!document.getElementById('mytube-ad-css')){"
@@ -329,43 +362,33 @@ final class YoutubeWebPane extends LinearLayout {
                 + "var skip=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,"
                 + ".ytp-skip-ad-button,.ytp-ad-skip-button-container button');"
                 + "if(skip){try{skip.click()}catch(e){}}"
-                + "var overlay=document.querySelector('.ad-showing,.ytp-ad-player-overlay');"
-                + "var v=document.querySelector('video.html5-main-video,video');"
-                + "if(overlay&&v&&v.duration&&isFinite(v.duration)&&v.duration<60){"
-                + "try{v.currentTime=v.duration;}catch(e){}}"
                 + "},700);}"
                 + "}catch(e){}"
                 + "})();";
         webView.evaluateJavascript(js, null);
     }
 
-    private void injectDownloadHook() {
+    private void removeLegacyDownloadFab() {
         if (webView == null) return;
-        String js = "(function(){"
-                + "try{"
-                + "if(document.getElementById('mytube-dl-fab'))return;"
-                + "var href=location.href||'';"
-                + "if(href.indexOf('watch')<0&&href.indexOf('shorts')<0)return;"
-                + "var b=document.createElement('button');"
-                + "b.id='mytube-dl-fab';"
-                + "b.textContent='다운로드';"
-                + "b.style.cssText='position:fixed;left:12px;right:12px;bottom:72px;z-index:2147483647;"
-                + "height:48px;border:0;border-radius:10px;background:#dc2626;color:#fff;"
-                + "font-size:16px;font-weight:700;';"
-                + "b.onclick=function(){if(window.MyTube)MyTube.downloadCurrent();};"
-                + "document.documentElement.appendChild(b);"
-                + "}catch(e){}"
-                + "})();";
-        webView.evaluateJavascript(js, null);
+        webView.evaluateJavascript(
+                "(function(){try{var b=document.getElementById('mytube-dl-fab');"
+                        + "if(b&&b.parentNode)b.parentNode.removeChild(b);}catch(e){}})();",
+                null);
     }
 
     static String normalizeVideoUrl(String url) {
         if (url == null || url.isEmpty()) return "";
+        // Ignore cookie consent / account interstitial URLs
+        String lower = url.toLowerCase();
+        if (lower.contains("accounts.google") || lower.contains("consent.youtube")
+                || lower.contains("consent.google") || lower.contains("cookie")) {
+            // still try extract video id if embedded
+        }
         String id = ExtractorBridge.videoIdOf(url);
         if (id.isEmpty()) {
-            // shorts path without full extract
             java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("/shorts/([A-Za-z0-9_-]{11})").matcher(url);
+                    .compile("(?:/shorts/|v=|youtu\\.be/)([A-Za-z0-9_-]{11})")
+                    .matcher(url);
             if (m.find()) id = m.group(1);
         }
         if (id.isEmpty()) return "";
@@ -385,16 +408,5 @@ final class YoutubeWebPane extends LinearLayout {
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
-    }
-
-    private final class JsBridge {
-        @JavascriptInterface
-        public void downloadCurrent() {
-            mainHandler.post(() -> {
-                if (host != null && !currentVideoUrl.isEmpty()) {
-                    host.onDownload(currentVideoUrl, currentTitle);
-                }
-            });
-        }
     }
 }

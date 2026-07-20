@@ -138,32 +138,123 @@ final class CookieStore {
     }
 
     /**
-     * Push saved session into WebView CookieManager so m.youtube.com shows the
-     * same logged-in account (home, subs, history) instead of our custom list.
+     * Ensure WebView CookieManager can show a logged-in YouTube session.
+     * <p>
+     * Important: do NOT spray every cookie onto google.com + youtube.com with
+     * forced {@code Secure}. That corrupts the jar and YouTube shows
+     * "쿠키 설정에 문제가 있습니다" and refuses to load.
+     * <p>
+     * If the WebView already has a live session (e.g. just finished
+     * {@link YoutubeLoginActivity}), leave it alone.
      */
     static void pushToWebView() {
         try {
             CookieManager cm = CookieManager.getInstance();
             cm.setAcceptCookie(true);
-            String header = isGuestMode() ? CONSENT : cookieHeader();
-            String[] hosts = {
-                    "https://www.youtube.com",
-                    "https://m.youtube.com",
-                    "https://youtube.com",
-                    "https://www.google.com",
-                    "https://accounts.google.com",
-            };
-            for (String part : header.split(";")) {
-                String c = part.trim();
-                if (c.isEmpty() || !c.contains("=")) continue;
-                for (String host : hosts) {
-                    cm.setCookie(host, c + "; path=/; Secure");
-                }
+            String live = cm.getCookie("https://www.youtube.com");
+            if (live == null || live.isEmpty()) {
+                live = cm.getCookie("https://m.youtube.com");
             }
+            if (looksLoggedIn(live)) {
+                // Session already present from login WebView — do not overwrite.
+                ensureConsentCookies(cm);
+                cm.flush();
+                return;
+            }
+            if (!hasAuthCookies()) {
+                ensureConsentCookies(cm);
+                cm.flush();
+                return;
+            }
+            restoreSavedCookiesToWebView(cm);
             cm.flush();
         } catch (Exception ignored) {
             // WebView may not be ready yet
         }
+    }
+
+    private static boolean looksLoggedIn(String cookieHeader) {
+        if (cookieHeader == null || cookieHeader.isEmpty()) return false;
+        String u = cookieHeader.toUpperCase(Locale.US);
+        return u.contains("LOGIN_INFO=")
+                || u.contains("SAPISID=")
+                || u.contains("__SECURE-1PSID=")
+                || u.contains("__SECURE-3PSID=");
+    }
+
+    private static void ensureConsentCookies(CookieManager cm) {
+        // Minimal consent so EU interstitial does not brick the page.
+        String[] hosts = {"https://www.youtube.com", "https://m.youtube.com", "https://youtube.com"};
+        for (String host : hosts) {
+            cm.setCookie(host, "SOCS=CAI; path=/; Secure");
+            cm.setCookie(host, "CONSENT=YES+; path=/; Secure");
+        }
+    }
+
+    private static void restoreSavedCookiesToWebView(CookieManager cm) {
+        String saved = "";
+        try {
+            saved = prefs().getString(KEY_HEADER, "");
+        } catch (Exception ignored) {
+            return;
+        }
+        if (saved == null || saved.trim().isEmpty()) {
+            ensureConsentCookies(cm);
+            return;
+        }
+        ensureConsentCookies(cm);
+        for (String part : saved.split(";")) {
+            String piece = part.trim();
+            int eq = piece.indexOf('=');
+            if (eq <= 0) continue;
+            String name = piece.substring(0, eq).trim();
+            String value = piece.substring(eq + 1).trim();
+            if (name.isEmpty() || name.equalsIgnoreCase("SOCS") || name.equalsIgnoreCase("CONSENT")) {
+                continue;
+            }
+            // Reject values that would break setCookie parsing.
+            if (value.contains(";") || value.contains("\n") || value.contains("\r")) continue;
+
+            String attrs = cookieAttrsForName(name);
+            String cookie = name + "=" + value + attrs;
+            for (String host : hostsForCookieName(name)) {
+                try {
+                    cm.setCookie(host, cookie);
+                } catch (Exception ignored) {
+                    // skip bad individual cookie
+                }
+            }
+        }
+    }
+
+    private static String cookieAttrsForName(String name) {
+        // __Host- requires path=/ Secure and no Domain (URL host is used).
+        // __Secure- requires Secure.
+        if (name.startsWith("__Host-")) return "; path=/; Secure";
+        if (name.startsWith("__Secure-") || name.startsWith("SID") || name.startsWith("HSID")
+                || name.startsWith("SSID") || name.startsWith("APISID") || name.startsWith("SAPISID")
+                || name.startsWith("LOGIN_INFO") || name.contains("PSID")) {
+            return "; path=/; Secure";
+        }
+        return "; path=/";
+    }
+
+    private static String[] hostsForCookieName(String name) {
+        String n = name.toUpperCase(Locale.US);
+        // Account / Google auth cookies stay on Google hosts only.
+        if (n.contains("ACCOUNT") || n.startsWith("LSID") || n.startsWith("OSID")
+                || n.contains("GAPS") || n.equals("NID") || n.contains("OTZ")) {
+            return new String[]{
+                    "https://accounts.google.com",
+                    "https://www.google.com",
+            };
+        }
+        // Default: YouTube only — never write YT session cookies onto google.com.
+        return new String[]{
+                "https://www.youtube.com",
+                "https://m.youtube.com",
+                "https://youtube.com",
+        };
     }
 
     /** Single cookie value from the stored header (first match). */
@@ -216,6 +307,16 @@ final class CookieStore {
                 .remove(KEY_SOURCE)
                 .remove(KEY_UPDATED_AT)
                 .apply();
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            // Remove broken jar so YouTube can load again as guest / fresh login.
+            cm.removeAllCookies(null);
+            cm.flush();
+            ensureConsentCookies(cm);
+            cm.flush();
+        } catch (Exception ignored) {
+            // no WebView yet
+        }
     }
 
     /**

@@ -9,7 +9,6 @@ import android.os.Looper;
 import android.util.AttributeSet;
 import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -22,12 +21,10 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
-import androidx.media3.ui.AspectRatioFrameLayout;
-import androidx.media3.ui.PlayerView;
-
 /**
- * Real YouTube site with an in-page native player overlay (ad-free + app quality)
- * positioned over the web video area so the rest of the page stays natural.
+ * Real YouTube site (m.youtube.com). On watch/shorts pages shows a bottom bar:
+ * «광고없이 재생» (full app player) + «대기열 등록».
+ * Does NOT auto-overlay a player on the web page.
  */
 final class YoutubeWebPane extends LinearLayout {
     interface Host {
@@ -35,8 +32,7 @@ final class YoutubeWebPane extends LinearLayout {
 
         void onNotVideoPage();
 
-        /** Auto / manual: start ad-free stream into the inline PlayerView. */
-        void onInlinePlay(String videoUrl, String pageTitle);
+        void onAdFreePlay(String videoUrl, String pageTitle);
 
         void onDownload(String videoUrl, String pageTitle);
     }
@@ -48,8 +44,7 @@ final class YoutubeWebPane extends LinearLayout {
         @Override
         public void run() {
             pollUrlFromJs();
-            if (inlineVisible) measureAndPlacePlayer();
-            mainHandler.postDelayed(this, 800);
+            mainHandler.postDelayed(this, 900);
         }
     };
 
@@ -60,19 +55,12 @@ final class YoutubeWebPane extends LinearLayout {
     private TextView titleView;
     private LinearLayout videoBar;
     private TextView videoLabel;
-    private FrameLayout playerSlot;
-    private PlayerView inlinePlayerView;
-    private TextView playerLoading;
     private View customFullscreenView;
-    private FrameLayout.LayoutParams savedPlayerLp;
-    private boolean fullscreenInline;
 
     private String currentUrl = HOME;
     private String currentVideoUrl = "";
     private String currentTitle = "";
     private boolean started;
-    private boolean inlineVisible;
-    private String lastInlineUrl = "";
 
     public YoutubeWebPane(Context context) {
         super(context);
@@ -88,14 +76,6 @@ final class YoutubeWebPane extends LinearLayout {
         this.host = host;
     }
 
-    PlayerView getInlinePlayerView() {
-        return inlinePlayerView;
-    }
-
-    boolean isInlineVisible() {
-        return inlineVisible;
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
     private void init(Context context) {
         setOrientation(VERTICAL);
@@ -109,10 +89,6 @@ final class YoutubeWebPane extends LinearLayout {
         toolbar.setPadding(dp(6), dp(6), dp(6), dp(6));
 
         Button back = toolButton(context, "←", v -> {
-            if (fullscreenInline) {
-                exitInlineFullscreen();
-                return;
-            }
             if (webView != null && webView.canGoBack()) webView.goBack();
         });
         toolbar.addView(back, new LayoutParams(dp(44), dp(40)));
@@ -176,7 +152,7 @@ final class YoutubeWebPane extends LinearLayout {
 
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
-                // HTML5 fullscreen from residual web player — cover stage.
+                // YouTube HTML5 fullscreen inside WebView.
                 if (customFullscreenView != null) return;
                 customFullscreenView = view;
                 stage.addView(view, new FrameLayout.LayoutParams(-1, -1));
@@ -210,45 +186,13 @@ final class YoutubeWebPane extends LinearLayout {
                 currentUrl = url == null ? "" : url;
                 onUrlMaybeVideo(currentUrl, true);
                 injectAdShield();
-                injectHideNativeVideoCss();
                 removeLegacyDownloadFab();
-                if (!currentVideoUrl.isEmpty()) {
-                    measureAndPlacePlayer();
-                    maybeStartInline();
-                }
             }
         });
         stage.addView(webView, new FrameLayout.LayoutParams(-1, -1));
-
-        // Native player sits over the web video rectangle.
-        playerSlot = new FrameLayout(context);
-        playerSlot.setBackgroundColor(Color.BLACK);
-        playerSlot.setVisibility(GONE);
-        playerSlot.setElevation(dp(8));
-
-        inlinePlayerView = new PlayerView(context);
-        inlinePlayerView.setBackgroundColor(Color.BLACK);
-        inlinePlayerView.setShutterBackgroundColor(Color.BLACK);
-        inlinePlayerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
-        inlinePlayerView.setUseController(true);
-        inlinePlayerView.setControllerShowTimeoutMs(2500);
-        inlinePlayerView.setFullscreenButtonClickListener(enter -> {
-            if (enter) enterInlineFullscreen();
-            else exitInlineFullscreen();
-        });
-        playerSlot.addView(inlinePlayerView, new FrameLayout.LayoutParams(-1, -1));
-
-        playerLoading = new TextView(context);
-        playerLoading.setText("광고 없이 준비 중…");
-        playerLoading.setTextColor(Color.WHITE);
-        playerLoading.setGravity(Gravity.CENTER);
-        playerLoading.setBackgroundColor(Color.argb(160, 0, 0, 0));
-        playerLoading.setVisibility(GONE);
-        playerSlot.addView(playerLoading, new FrameLayout.LayoutParams(-1, -1));
-
-        stage.addView(playerSlot, new FrameLayout.LayoutParams(1, 1));
         addView(stage, new LayoutParams(-1, 0, 1));
 
+        // Bottom bar only — user taps «광고없이 재생» to open full app player.
         videoBar = new LinearLayout(context);
         videoBar.setOrientation(VERTICAL);
         videoBar.setBackgroundColor(Color.rgb(24, 24, 24));
@@ -265,16 +209,17 @@ final class YoutubeWebPane extends LinearLayout {
         LinearLayout row = new LinearLayout(context);
         row.setOrientation(HORIZONTAL);
 
-        Button retry = new Button(context);
-        retry.setText("다시 재생");
-        retry.setAllCaps(false);
-        retry.setTextColor(Color.WHITE);
-        retry.setBackgroundColor(Color.rgb(30, 64, 175));
-        retry.setOnClickListener(v -> {
-            lastInlineUrl = "";
-            maybeStartInline();
+        Button adFree = new Button(context);
+        adFree.setText("광고없이 재생");
+        adFree.setAllCaps(false);
+        adFree.setTextColor(Color.WHITE);
+        adFree.setBackgroundColor(Color.rgb(30, 64, 175));
+        adFree.setOnClickListener(v -> {
+            if (host != null && !currentVideoUrl.isEmpty()) {
+                host.onAdFreePlay(currentVideoUrl, currentTitle);
+            }
         });
-        row.addView(retry, new LayoutParams(0, dp(48), 1));
+        row.addView(adFree, new LayoutParams(0, dp(48), 1));
 
         Button download = new Button(context);
         download.setText("대기열 등록");
@@ -314,7 +259,7 @@ final class YoutubeWebPane extends LinearLayout {
         CookieStore.pushToWebView();
         if (webView != null) webView.loadUrl(HOME);
         mainHandler.removeCallbacks(urlPoller);
-        mainHandler.postDelayed(urlPoller, 800);
+        mainHandler.postDelayed(urlPoller, 1000);
     }
 
     void reloadWithCookies() {
@@ -323,22 +268,16 @@ final class YoutubeWebPane extends LinearLayout {
     }
 
     void goHome() {
-        hideInlinePlayer();
         CookieStore.pushToWebView();
         if (webView != null) webView.loadUrl(HOME);
         applyVideoState("", HOME);
     }
 
     boolean canGoBack() {
-        if (fullscreenInline) return true;
         return webView != null && webView.canGoBack();
     }
 
     void goBack() {
-        if (fullscreenInline) {
-            exitInlineFullscreen();
-            return;
-        }
         if (webView != null && webView.canGoBack()) webView.goBack();
     }
 
@@ -350,12 +289,11 @@ final class YoutubeWebPane extends LinearLayout {
     void onResume() {
         if (webView != null) webView.onResume();
         mainHandler.removeCallbacks(urlPoller);
-        mainHandler.postDelayed(urlPoller, 400);
+        mainHandler.postDelayed(urlPoller, 500);
     }
 
     void destroy() {
         mainHandler.removeCallbacks(urlPoller);
-        if (inlinePlayerView != null) inlinePlayerView.setPlayer(null);
         if (webView != null) {
             webView.stopLoading();
             webView.destroy();
@@ -371,60 +309,13 @@ final class YoutubeWebPane extends LinearLayout {
         return currentTitle;
     }
 
-    void setInlineLoading(boolean loading) {
-        if (playerLoading != null) {
-            playerLoading.setVisibility(loading ? VISIBLE : GONE);
-            if (loading) playerLoading.setText("광고 없이 준비 중…");
-        }
-    }
-
-    void setInlineError(String message) {
-        if (playerLoading != null) {
-            playerLoading.setVisibility(VISIBLE);
-            playerLoading.setText(message == null ? "재생 실패" : message);
-        }
+    /** Kept for MainActivity compatibility — no in-page player anymore. */
+    boolean isInlineVisible() {
+        return false;
     }
 
     void hideInlinePlayer() {
-        inlineVisible = false;
-        lastInlineUrl = "";
-        fullscreenInline = false;
-        if (playerSlot != null) playerSlot.setVisibility(GONE);
-        if (playerLoading != null) playerLoading.setVisibility(GONE);
-        if (inlinePlayerView != null) inlinePlayerView.setPlayer(null);
-    }
-
-    void showInlineShell() {
-        inlineVisible = true;
-        if (playerSlot != null) playerSlot.setVisibility(VISIBLE);
-        setInlineLoading(true);
-        measureAndPlacePlayer();
-        injectHideNativeVideoCss();
-        pauseWebVideos();
-    }
-
-    private void enterInlineFullscreen() {
-        if (playerSlot == null || stage == null || fullscreenInline) return;
-        fullscreenInline = true;
-        savedPlayerLp = (FrameLayout.LayoutParams) playerSlot.getLayoutParams();
-        FrameLayout.LayoutParams full = new FrameLayout.LayoutParams(-1, -1);
-        playerSlot.setLayoutParams(full);
-        playerSlot.bringToFront();
-    }
-
-    private void exitInlineFullscreen() {
-        if (!fullscreenInline || playerSlot == null) return;
-        fullscreenInline = false;
-        if (savedPlayerLp != null) playerSlot.setLayoutParams(savedPlayerLp);
-        else measureAndPlacePlayer();
-    }
-
-    private void maybeStartInline() {
-        if (currentVideoUrl.isEmpty() || host == null) return;
-        if (currentVideoUrl.equals(lastInlineUrl) && inlineVisible) return;
-        lastInlineUrl = currentVideoUrl;
-        showInlineShell();
-        host.onInlinePlay(currentVideoUrl, currentTitle);
+        // no-op
     }
 
     private void pollUrlFromJs() {
@@ -454,7 +345,6 @@ final class YoutubeWebPane extends LinearLayout {
             if (!currentVideoUrl.isEmpty()) {
                 currentVideoUrl = "";
                 hideVideoBar();
-                hideInlinePlayer();
                 if (host != null) host.onNotVideoPage();
             } else {
                 hideVideoBar();
@@ -467,108 +357,16 @@ final class YoutubeWebPane extends LinearLayout {
             currentTitle = "YouTube 영상";
         }
         showVideoBar(currentTitle);
-        if (changed) {
-            if (host != null) host.onVideoDetected(videoUrl, currentTitle);
-            lastInlineUrl = "";
-            // Small delay so m.youtube player DOM exists.
-            mainHandler.postDelayed(this::maybeStartInline, 500);
-        }
+        if (changed && host != null) host.onVideoDetected(videoUrl, currentTitle);
     }
 
     private void showVideoBar(String title) {
         videoBar.setVisibility(VISIBLE);
-        videoLabel.setText("무광고 재생 · " + (title == null ? "" : title));
+        videoLabel.setText("영상 · " + (title == null ? "" : title));
     }
 
     private void hideVideoBar() {
         videoBar.setVisibility(GONE);
-    }
-
-    private void measureAndPlacePlayer() {
-        if (webView == null || playerSlot == null || !inlineVisible || fullscreenInline) return;
-        webView.evaluateJavascript(
-                "(function(){"
-                        + "function box(el){if(!el)return null;var r=el.getBoundingClientRect();"
-                        + "if(r.width<40||r.height<40)return null;"
-                        + "return [Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)];}"
-                        + "var sels=['ytm-player-large-container','#player-container-id','#player',"
-                        + "'.html5-video-player','ytm-player-component','#movie_player',"
-                        + "'ytm-single-column-watch-next-results-renderer ytm-player-large-container',"
-                        + "'video.html5-main-video','video'];"
-                        + "for(var i=0;i<sels.length;i++){"
-                        + "var el=document.querySelector(sels[i]);"
-                        + "var b=box(el);if(b)return JSON.stringify(b);}"
-                        + "var vids=document.getElementsByTagName('video');"
-                        + "for(var j=0;j<vids.length;j++){var b2=box(vids[j]);if(b2)return JSON.stringify(b2);}"
-                        + "return '';"
-                        + "})()",
-                value -> {
-                    String raw = stripJsString(value);
-                    mainHandler.post(() -> applyPlayerRectJson(raw));
-                });
-    }
-
-    private void applyPlayerRectJson(String raw) {
-        if (raw == null || raw.isEmpty() || playerSlot == null || stage == null) {
-            // Fallback: top 16:9 band
-            int w = stage.getWidth();
-            if (w <= 0) w = getWidth();
-            int h = (int) (w * 9f / 16f);
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(w, Math.max(h, dp(180)));
-            lp.topMargin = 0;
-            lp.leftMargin = 0;
-            playerSlot.setLayoutParams(lp);
-            return;
-        }
-        try {
-            String s = raw.trim();
-            if (s.startsWith("[")) s = s.substring(1);
-            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
-            String[] p = s.split(",");
-            if (p.length < 4) return;
-            int left = (int) Float.parseFloat(p[0].trim());
-            int top = (int) Float.parseFloat(p[1].trim());
-            int width = (int) Float.parseFloat(p[2].trim());
-            int height = (int) Float.parseFloat(p[3].trim());
-            // WebView CSS px ≈ density-independent; convert to view coords.
-            float density = getResources().getDisplayMetrics().density;
-            // getBoundingClientRect is in CSS pixels relative to webview viewport.
-            int l = Math.round(left);
-            int t = Math.round(top);
-            int w = Math.round(width);
-            int h = Math.round(height);
-            if (w < dp(80) || h < dp(45)) return;
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(w, h);
-            lp.leftMargin = Math.max(0, l);
-            lp.topMargin = Math.max(0, t);
-            playerSlot.setLayoutParams(lp);
-            playerSlot.bringToFront();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void injectHideNativeVideoCss() {
-        if (webView == null) return;
-        String js = "(function(){try{"
-                + "var css='video,.html5-video-player .video-stream,"
-                + "ytm-player-large-container video,#player video"
-                + "{opacity:0!important;pointer-events:none!important}"
-                + ".ytp-chrome-bottom,.ytp-gradient-bottom,.ytp-pause-overlay"
-                + "{opacity:0!important;pointer-events:none!important}';"
-                + "if(!document.getElementById('mytube-hide-vid')){"
-                + "var s=document.createElement('style');s.id='mytube-hide-vid';s.textContent=css;"
-                + "document.documentElement.appendChild(s);}"
-                + "}catch(e){}})();";
-        webView.evaluateJavascript(js, null);
-    }
-
-    private void pauseWebVideos() {
-        if (webView == null) return;
-        webView.evaluateJavascript(
-                "(function(){try{var vs=document.getElementsByTagName('video');"
-                        + "for(var i=0;i<vs.length;i++){try{vs[i].pause();vs[i].muted=true;}catch(e){}}}"
-                        + "catch(e){}})();",
-                null);
     }
 
     private void injectAdShield() {

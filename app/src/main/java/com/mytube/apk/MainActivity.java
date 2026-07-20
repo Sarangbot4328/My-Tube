@@ -356,7 +356,7 @@ public final class MainActivity extends Activity {
         playerChrome.addView(row, new LinearLayout.LayoutParams(-1, -2));
 
         TextView tip = new TextView(this);
-        tip.setText("광고 없이 재생 · «대기열 등록»으로 순차 다운로드");
+        tip.setText("광고 없이 재생 중 · 설정 화질 적용 · «대기열 등록» 가능");
         tip.setTextColor(Color.rgb(148, 163, 184));
         tip.setTextSize(11);
         tip.setPadding(0, dp(6), 0, 0);
@@ -382,13 +382,10 @@ public final class MainActivity extends Activity {
         youtubeWeb = new YoutubeWebPane(this);
         youtubeWeb.setHost(new YoutubeWebPane.Host() {
             @Override public void onVideoDetected(String videoUrl, String pageTitle) {}
+            @Override public void onNotVideoPage() {}
             @Override
-            public void onNotVideoPage() {
-                if (youtubeWeb != null) youtubeWeb.hideInlinePlayer();
-            }
-            @Override
-            public void onInlinePlay(String videoUrl, String pageTitle) {
-                playWebInline(videoUrl, pageTitle);
+            public void onAdFreePlay(String videoUrl, String pageTitle) {
+                playWebVideo(videoUrl, pageTitle);
             }
             @Override
             public void onDownload(String videoUrl, String pageTitle) {
@@ -483,9 +480,9 @@ public final class MainActivity extends Activity {
         return DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this));
     }
 
-    /** In-page ad-free play over the YouTube web player (settings quality applied). */
-    private void playWebInline(String videoUrl, String title) {
-        if (videoUrl == null || videoUrl.isEmpty() || youtubeWeb == null) return;
+    /** Full app player (settings quality + no ads). Triggered by bottom «광고없이 재생». */
+    private void playWebVideo(String videoUrl, String title) {
+        if (videoUrl == null || videoUrl.isEmpty()) return;
         String thumb = YoutubeWebPane.thumbnailUrlFor(videoUrl);
         TubeItem item = new TubeItem(
                 title == null || title.isEmpty() ? "YouTube 영상" : title,
@@ -495,55 +492,8 @@ public final class MainActivity extends Activity {
                 true,
                 videoUrl.contains("/shorts/")
         );
-        currentItem = item;
-        currentPlaybackData = null;
-        offlinePlaying = false;
-        playing = true;
-        preparingAutoplay = false;
-        autoplayPlayedKeys.clear();
-        markAutoplayPlayed(item);
-
-        // Attach ExoPlayer to the in-page PlayerView (not full-screen layer).
-        if (playerView != null) playerView.setPlayer(null);
-        if (playerLayer != null) playerLayer.setVisibility(View.GONE);
-        PlayerView inline = youtubeWeb.getInlinePlayerView();
-        if (inline != null) inline.setPlayer(player);
-        youtubeWeb.showInlineShell();
-        youtubeWeb.setInlineLoading(true);
-
-        final TubeItem playItem = item;
-        executor.execute(() -> {
-            try {
-                PlaybackData data = ExtractorBridge.resolve(playItem.url);
-                mainHandler.post(() -> {
-                    if (!playing || currentItem == null
-                            || !playItem.url.equals(currentItem.url)) return;
-                    startPlayerInline(data);
-                });
-            } catch (Exception e) {
-                mainHandler.post(() -> {
-                    preparingAutoplay = false;
-                    String msg = e.getMessage() == null ? "재생 실패" : e.getMessage();
-                    if (youtubeWeb != null) {
-                        youtubeWeb.setInlineError("재생 실패 · 다시 재생을 눌러 보세요");
-                    }
-                    Toast.makeText(this, "재생 실패: " + msg, Toast.LENGTH_SHORT).show();
-                });
-            }
-        });
-    }
-
-    private void startPlayerInline(PlaybackData data) {
-        playing = true;
-        preparingAutoplay = false;
-        currentPlaybackData = data;
-        if (youtubeWeb != null) youtubeWeb.setInlineLoading(false);
-        player.setMediaItem(buildMediaItem(data.mediaUrl));
-        resetDefaultQualityForNewMedia();
-        player.prepare();
-        player.play();
-        updateKeepScreenOnForPlayer();
-        // Tracks may arrive slightly later; default quality applies via listener.
+        // Force full overlay player path (not list-mode branch only).
+        playFullOverlay(item, true);
     }
 
     private void downloadWebVideo(String videoUrl, String title) {
@@ -804,7 +754,7 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.8");
+        version.setText("버전 My Tube 1.8.1");
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
         version.setPadding(dp(16), 0, dp(16), dp(10));
@@ -1048,7 +998,7 @@ public final class MainActivity extends Activity {
         if (youtubeViewModeText == null) return;
         boolean web = DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this));
         youtubeViewModeText.setText(web
-                ? "사이트 화면: YouTube 페이지 위에 무광고·설정화질 재생 (대기열 등록 가능)"
+                ? "사이트 화면: YouTube 페이지 + 하단 «광고없이 재생 / 대기열 등록»"
                 : "목록·검색: 앱 안 검색 리스트에서 재생·대기열 등록");
         if (viewWebButton != null) styleChoiceButton(viewWebButton, web);
         if (viewListButton != null) styleChoiceButton(viewListButton, !web);
@@ -1426,14 +1376,10 @@ public final class MainActivity extends Activity {
     }
 
     private void play(TubeItem item, boolean resetAutoplayHistory) {
-        // Web mode: play in-page overlay instead of full black screen.
-        if (isWebViewMode() && youtubeWeb != null
-                && currentScreen == SCREEN_SEARCH
-                && listModeRoot != null
-                && listModeRoot.getVisibility() != View.VISIBLE) {
-            playWebInline(item.url, item.title);
-            return;
-        }
+        playFullOverlay(item, resetAutoplayHistory);
+    }
+
+    private void playFullOverlay(TubeItem item, boolean resetAutoplayHistory) {
         currentItem = item;
         currentPlaybackData = null;
         offlinePlaying = false;
@@ -1441,13 +1387,6 @@ public final class MainActivity extends Activity {
         if (resetAutoplayHistory) preparingAutoplay = false;
         if (resetAutoplayHistory) autoplayPlayedKeys.clear();
         markAutoplayPlayed(item);
-        // Full overlay player (list mode / offline).
-        if (youtubeWeb != null) {
-            youtubeWeb.hideInlinePlayer();
-            if (youtubeWeb.getInlinePlayerView() != null) {
-                youtubeWeb.getInlinePlayerView().setPlayer(null);
-            }
-        }
         if (playerView != null) playerView.setPlayer(player);
         showPlayingLayout(true);
         if (playerDownloadButton != null) playerDownloadButton.setVisibility(View.VISIBLE);
@@ -1689,12 +1628,6 @@ public final class MainActivity extends Activity {
         if (qualityButton != null) qualityButton.setText("화질");
         if (playerDownloadButton != null) playerDownloadButton.setVisibility(View.VISIBLE);
         setFullscreen(false);
-        if (youtubeWeb != null) {
-            youtubeWeb.hideInlinePlayer();
-            if (youtubeWeb.getInlinePlayerView() != null) {
-                youtubeWeb.getInlinePlayerView().setPlayer(null);
-            }
-        }
         if (playerView != null) playerView.setPlayer(player);
         showPlayingLayout(false);
     }
@@ -1867,11 +1800,6 @@ public final class MainActivity extends Activity {
     public void onBackPressed() {
         if (fullscreen) {
             setFullscreen(false);
-            return;
-        }
-        if (youtubeWeb != null && youtubeWeb.isInlineVisible() && isWebViewMode()) {
-            // Stop inline play but stay on the YouTube page.
-            closePlayer();
             return;
         }
         if (playing) {

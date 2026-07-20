@@ -146,23 +146,8 @@ final class DownloadQueue {
         });
         try {
             ExtractorBridge.DownloadOption option = job.option;
-            String savedUri;
-            try {
-                savedUri = MediaDownloader.save(app, option, job.title, progress);
-            } catch (Exception first) {
-                if (MediaDownloader.requiresFreshUrl(first)) {
-                    main.post(() -> {
-                        if (listener != null) listener.onStatus("스트림 재발급 후 재시도 · " + job.title);
-                    });
-                    ExtractorBridge.DownloadOption refreshed =
-                            ExtractorBridge.refreshOption(job.videoUrl, option);
-                    if (refreshed == null) throw first;
-                    option = refreshed;
-                    savedUri = MediaDownloader.save(app, option, job.title, progress);
-                } else {
-                    throw first;
-                }
-            }
+            String savedUri = MediaDownloader.save(
+                    app, option, job.videoUrl, job.title, progress);
             String id = job.id();
             DownloadItem item = new DownloadItem(
                     id, job.title, job.uploader, savedUri, job.thumbnailUrl, option.label, job.searchText);

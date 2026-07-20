@@ -596,6 +596,46 @@ final class ExtractorBridge {
         return best;
     }
 
+    /**
+     * Re-resolves the exact media representations used by an in-progress download.
+     * Matching itags prevents resumed bytes from two different encodes being mixed.
+     */
+    static DownloadOption refreshSameOption(String url, DownloadOption previous) throws Exception {
+        if (previous == null) return null;
+        List<DownloadOption> options = downloadOptions(url);
+        String previousVideoItag = itagOf(previous.videoUrl);
+        String previousAudioItag = itagOf(previous.audioUrl);
+
+        if (!previousVideoItag.isEmpty()) {
+            for (DownloadOption option : options) {
+                if (!previousVideoItag.equals(itagOf(option.videoUrl))) continue;
+                if (!previousAudioItag.isEmpty()
+                        && !previousAudioItag.equals(itagOf(option.audioUrl))) continue;
+                return option;
+            }
+            return null;
+        }
+
+        // Direct media URLs normally contain an itag. Keep a conservative fallback
+        // for clients that omit it while preserving quality, container and layout.
+        for (DownloadOption option : options) {
+            if (option.height == previous.height
+                    && option.muxed == previous.muxed
+                    && option.ext.equalsIgnoreCase(previous.ext)) {
+                return option;
+            }
+        }
+        return null;
+    }
+
+    private static String itagOf(String mediaUrl) {
+        if (mediaUrl == null || mediaUrl.isEmpty()) return "";
+        Matcher matcher = Pattern.compile(
+                "(?:[?&]|%26)itag(?:=|%3[dD])(\\d+)", Pattern.CASE_INSENSITIVE)
+                .matcher(mediaUrl);
+        return matcher.find() ? matcher.group(1) : "";
+    }
+
     private static List<DownloadOption> newPipeDownloadOptions(String url) throws Exception {
         StreamInfo info = StreamInfo.getInfo(ServiceList.YouTube, url);
         Map<Integer, DownloadOption> byHeight = new LinkedHashMap<>();

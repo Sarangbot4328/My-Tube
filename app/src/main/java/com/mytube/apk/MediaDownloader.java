@@ -26,9 +26,11 @@ import java.nio.ByteBuffer;
 final class MediaDownloader {
     private static final int CONNECT_TIMEOUT_MS = 30_000;
     private static final int READ_TIMEOUT_MS = 45_000;
-    private static final int MAX_ATTEMPTS = 3;
-    private static final int MAX_CONSECUTIVE_STALLS = 4;
-    private static final long RANGE_CHUNK_BYTES = 8L * 1024 * 1024;
+    private static final int MAX_ATTEMPTS = 8;
+    private static final int STALLS_BEFORE_URL_REFRESH = 3;
+    private static final int MAX_CONSECUTIVE_STALLS = 10;
+    private static final int MAX_SOURCE_REFRESHES = 5;
+    private static final long RANGE_CHUNK_BYTES = 16L * 1024 * 1024;
 
     interface ProgressListener {
         void onProgress(String status);
@@ -38,19 +40,36 @@ final class MediaDownloader {
         void write(OutputStream out) throws Exception;
     }
 
+    private interface SourceRefresher {
+        MediaSource refresh() throws Exception;
+    }
+
+    private static final class MediaSource {
+        final String url;
+        final String userAgent;
+
+        MediaSource(String url, String userAgent) {
+            this.url = url;
+            this.userAgent = userAgent;
+        }
+    }
+
     private MediaDownloader() {}
 
     // Returns the uri string of the saved file.
-    static String save(Context context, ExtractorBridge.DownloadOption option, String title,
-                       ProgressListener listener) throws Exception {
+    static String save(Context context, ExtractorBridge.DownloadOption option, String pageUrl,
+                       String title, ProgressListener listener) throws Exception {
         RequestPacer.beforeDownload();
         String fileName = safeFileName(title, option.ext);
         File cache = context.getCacheDir();
+        final ExtractorBridge.DownloadOption[] activeOption = {option};
+        SourceRefresher videoRefresher = () -> refreshedSource(pageUrl, activeOption, false);
 
         if (!option.muxed) {
             File tmp = File.createTempFile("mtp", ".tmp", cache);
             try {
-                downloadToFile(option.videoUrl, option.userAgent, tmp, "다운로드", listener);
+                downloadToFile(new MediaSource(option.videoUrl, option.userAgent), videoRefresher,
+                        tmp, "다운로드", listener);
                 report(listener, "저장 중...");
                 return writeToTarget(context, fileName, option.mime, out -> copyFile(tmp, out));
             } finally {
@@ -68,9 +87,13 @@ final class MediaDownloader {
             // download combined with video/audio parallelism opened up to 8 CDN
             // connections and frequently triggered YouTube throttling (403/429).
             report(listener, "영상 다운로드…");
-            downloadToFile(option.videoUrl, option.userAgent, videoTmp, "영상", listener);
+            downloadToFile(new MediaSource(option.videoUrl, option.userAgent), videoRefresher,
+                    videoTmp, "영상", listener);
             report(listener, "오디오 다운로드…");
-            downloadToFile(option.audioUrl, option.userAgent, audioTmp, "오디오", listener);
+            ExtractorBridge.DownloadOption current = activeOption[0];
+            SourceRefresher audioRefresher = () -> refreshedSource(pageUrl, activeOption, true);
+            downloadToFile(new MediaSource(current.audioUrl, current.userAgent), audioRefresher,
+                    audioTmp, "오디오", listener);
             report(listener, "영상·오디오 합치는 중...");
             try {
                 muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(),
@@ -122,18 +145,44 @@ final class MediaDownloader {
         if (listener != null) listener.onProgress(status);
     }
 
-    private static void downloadToFile(String url, String userAgent, File dest, String label,
-                                       ProgressListener listener) throws Exception {
+    private static MediaSource refreshedSource(String pageUrl,
+                                               ExtractorBridge.DownloadOption[] activeOption,
+                                               boolean audio) throws Exception {
+        if (pageUrl == null || pageUrl.isEmpty()) {
+            throw new java.io.IOException("다운로드 주소를 갱신할 원본 영상 주소가 없습니다.");
+        }
+        ExtractorBridge.DownloadOption refreshed =
+                ExtractorBridge.refreshSameOption(pageUrl, activeOption[0]);
+        if (refreshed == null) {
+            throw new java.io.IOException("같은 화질의 다운로드 주소를 다시 찾지 못했습니다.");
+        }
+        String refreshedUrl = audio ? refreshed.audioUrl : refreshed.videoUrl;
+        if (refreshedUrl == null || refreshedUrl.isEmpty()) {
+            throw new java.io.IOException("갱신된 미디어 주소가 비어 있습니다.");
+        }
+        activeOption[0] = refreshed;
+        return new MediaSource(refreshedUrl, refreshed.userAgent);
+    }
+
+    private static void downloadToFile(MediaSource initialSource, SourceRefresher refresher,
+                                       File dest, String label, ProgressListener listener)
+            throws Exception {
+        MediaSource source = initialSource;
         long rangeTotal = -1L;
         try {
-            rangeTotal = probeRangeTotal(url, userAgent);
+            rangeTotal = probeRangeTotal(source.url, source.userAgent);
         } catch (Exception probeError) {
             String message = messageOf(probeError);
-            if (requiresFreshUrl(probeError) || message.contains("http 429")) throw probeError;
+            if (requiresFreshUrl(probeError)) {
+                source = refresher.refresh();
+                rangeTotal = probeRangeTotal(source.url, source.userAgent);
+            } else if (message.contains("http 429")) {
+                throw probeError;
+            }
             // A server that rejects the one-byte probe may still allow a normal GET.
         }
         if (rangeTotal > 0L) {
-            copyUrlInSequentialChunks(url, userAgent, dest, rangeTotal, label, listener);
+            copyUrlInSequentialChunks(source, refresher, dest, rangeTotal, label, listener);
             if (dest.length() != rangeTotal) {
                 throw new java.io.EOFException("다운로드 크기가 원본과 일치하지 않습니다.");
             }
@@ -141,15 +190,31 @@ final class MediaDownloader {
         }
 
         Exception last = null;
+        int consecutiveStalls = 0;
+        int sourceRefreshes = 0;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 long already = dest.exists() ? dest.length() : 0L;
-                copyUrlResumable(url, userAgent, dest, already, label, listener);
+                copyUrlResumable(source.url, source.userAgent, dest, already, label, listener);
                 if (dest.length() <= 0) throw new java.io.IOException("받은 데이터가 비어 있습니다.");
                 return;
             } catch (Exception e) {
                 last = e;
-                if (!isRetryable(e) || attempt == MAX_ATTEMPTS) break;
+                if (isRetryable(e)) consecutiveStalls++;
+                boolean shouldRefresh = requiresFreshUrl(e)
+                        || consecutiveStalls >= STALLS_BEFORE_URL_REFRESH;
+                if (shouldRefresh && sourceRefreshes < MAX_SOURCE_REFRESHES) {
+                    try {
+                        source = refresher.refresh();
+                        sourceRefreshes++;
+                        consecutiveStalls = 0;
+                        report(listener, progressText(label, dest.length(), -1L)
+                                + " · 다운로드 주소 갱신 중…");
+                    } catch (Exception refreshError) {
+                        if (requiresFreshUrl(e)) throw refreshError;
+                    }
+                }
+                if ((!isRetryable(e) && !requiresFreshUrl(e)) || attempt == MAX_ATTEMPTS) break;
                 report(listener, "연결이 끊겨 이어받는 중 (" + (attempt + 1)
                         + "/" + MAX_ATTEMPTS + ")…");
                 try {
@@ -203,7 +268,8 @@ final class MediaDownloader {
      * CDN connection, but a stalled 4K transfer can reconnect from the exact byte
      * already written instead of waiting on one huge response for several minutes.
      */
-    private static void copyUrlInSequentialChunks(String url, String userAgent, File dest,
+    private static void copyUrlInSequentialChunks(MediaSource initialSource,
+                                                  SourceRefresher refresher, File dest,
                                                   long total, String label,
                                                   ProgressListener listener) throws Exception {
         if (dest.length() > total) {
@@ -214,6 +280,8 @@ final class MediaDownloader {
         long done = dest.length();
         long[] lastReport = {done};
         int consecutiveStalls = 0;
+        int sourceRefreshes = 0;
+        MediaSource source = initialSource;
 
         while (done < total) {
             if (Thread.currentThread().isInterrupted()) {
@@ -222,7 +290,7 @@ final class MediaDownloader {
             long before = done;
             long end = Math.min(total - 1L, done + RANGE_CHUNK_BYTES - 1L);
             try {
-                done = downloadRangeChunk(url, userAgent, dest, done, end, total,
+                done = downloadRangeChunk(source.url, source.userAgent, dest, done, end, total,
                         label, listener, lastReport);
                 consecutiveStalls = 0;
             } catch (Exception error) {
@@ -235,6 +303,20 @@ final class MediaDownloader {
                     consecutiveStalls++;
                 }
                 done = written;
+                boolean shouldRefresh = requiresFreshUrl(error)
+                        || (!advanced && consecutiveStalls >= STALLS_BEFORE_URL_REFRESH);
+                if (shouldRefresh && sourceRefreshes < MAX_SOURCE_REFRESHES) {
+                    try {
+                        report(listener, progressText(label, done, total)
+                                + " · 다운로드 주소 갱신 중…");
+                        source = refresher.refresh();
+                        sourceRefreshes++;
+                        consecutiveStalls = 0;
+                        continue;
+                    } catch (Exception refreshError) {
+                        if (requiresFreshUrl(error)) throw refreshError;
+                    }
+                }
                 if (!isRetryable(error) || consecutiveStalls >= MAX_CONSECUTIVE_STALLS) {
                     throw error;
                 }
@@ -269,9 +351,14 @@ final class MediaDownloader {
             if (code != 206) {
                 throw new java.io.IOException("서버가 이어받기 요청을 거부했습니다 (HTTP " + code + ")");
             }
-            long responseStart = startFromContentRange(connection.getHeaderField("Content-Range"));
+            String contentRange = connection.getHeaderField("Content-Range");
+            long responseStart = startFromContentRange(contentRange);
             if (responseStart >= 0L && responseStart != start) {
                 throw new java.io.IOException("서버의 이어받기 위치가 일치하지 않습니다.");
+            }
+            long responseTotal = totalFromContentRange(contentRange);
+            if (responseTotal > 0L && responseTotal != total) {
+                throw new java.io.IOException("갱신된 스트림의 전체 크기가 달라 이어받을 수 없습니다.");
             }
 
             long current = start;

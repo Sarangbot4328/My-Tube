@@ -7,7 +7,7 @@ package com.mytube.apk;
 final class RequestPacer {
     private static final long MIN_API_GAP_MS = 450L;
     private static final long MIN_SEARCH_PAGE_GAP_MS = 700L;
-    private static final long MIN_DOWNLOAD_GAP_MS = 1200L;
+    private static final long MIN_DOWNLOAD_GAP_MS = 200L;
 
     private static long lastApiAt;
     private static long lastSearchPageAt;

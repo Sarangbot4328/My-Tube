@@ -19,14 +19,24 @@ import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
 
 // Saves a chosen quality to local storage. Progressive streams are written
 // straight to disk; adaptive (1080p+) qualities download the mp4 video and m4a
 // audio separately and combine them with the OS MediaMuxer (no ffmpeg needed).
 final class MediaDownloader {
-    private static final int CONNECT_TIMEOUT_MS = 60_000;
+    private static final int CONNECT_TIMEOUT_MS = 45_000;
     private static final int READ_TIMEOUT_MS = 180_000;
     private static final int MAX_ATTEMPTS = 5;
+    /** Parallel Range workers for faster single-file pulls (when server allows). */
+    private static final int PARALLEL_PARTS = 4;
+    private static final long PARALLEL_MIN_BYTES = 2L * 1024 * 1024;
 
     interface ProgressListener {
         void onProgress(String status);
@@ -61,8 +71,23 @@ final class MediaDownloader {
         File audioTmp = File.createTempFile("mta", ".m4a", cache);
         File muxed = File.createTempFile("mtmux", ".mp4", cache);
         try {
-            downloadToFile(option.videoUrl, option.userAgent, videoTmp, "영상 다운로드", listener);
-            downloadToFile(option.audioUrl, option.userAgent, audioTmp, "오디오 다운로드", listener);
+            // Video + audio in parallel (big speedup for 1080p muxed).
+            report(listener, "영상·오디오 동시 다운로드…");
+            ExecutorService pair = Executors.newFixedThreadPool(2);
+            try {
+                Future<?> fv = pair.submit(() -> {
+                    downloadToFile(option.videoUrl, option.userAgent, videoTmp, "영상", listener);
+                    return null;
+                });
+                Future<?> fa = pair.submit(() -> {
+                    downloadToFile(option.audioUrl, option.userAgent, audioTmp, "오디오", listener);
+                    return null;
+                });
+                fv.get();
+                fa.get();
+            } finally {
+                pair.shutdownNow();
+            }
             report(listener, "영상·오디오 합치는 중...");
             try {
                 muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(), muxed.getAbsolutePath());
@@ -118,14 +143,14 @@ final class MediaDownloader {
         Exception last = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
-                long already = dest.exists() ? dest.length() : 0L;
-                // Fresh attempt from 0 if file is empty or server rejects Range.
-                if (attempt == 1 && already > 0) {
-                    //noinspection ResultOfMethodCallIgnored
-                    dest.delete();
-                    already = 0;
+                //noinspection ResultOfMethodCallIgnored
+                if (dest.exists()) dest.delete();
+                // Prefer multi-connection Range when Content-Length is known.
+                if (tryParallelDownload(url, userAgent, dest, label, listener)) {
+                    if (dest.length() <= 0) throw new java.io.IOException("받은 데이터가 비어 있습니다.");
+                    return;
                 }
-                copyUrlResumable(url, userAgent, dest, already, label, listener);
+                copyUrlResumable(url, userAgent, dest, 0, label, listener);
                 if (dest.length() <= 0) throw new java.io.IOException("받은 데이터가 비어 있습니다.");
                 return;
             } catch (Exception e) {
@@ -133,19 +158,141 @@ final class MediaDownloader {
                 if (!isRetryable(e) || attempt == MAX_ATTEMPTS) break;
                 report(listener, "연결 재시도 " + attempt + "/" + MAX_ATTEMPTS + "…");
                 try {
-                    Thread.sleep(1000L * attempt);
+                    Thread.sleep(700L * attempt);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     throw e;
                 }
-                // On hard failures, restart file from scratch next loop.
-                if (messageOf(e).contains("416") || messageOf(e).contains("http 4")) {
-                    //noinspection ResultOfMethodCallIgnored
-                    dest.delete();
-                }
+                //noinspection ResultOfMethodCallIgnored
+                dest.delete();
             }
         }
         throw last == null ? new java.io.IOException("다운로드 실패") : last;
+    }
+
+    /** @return true if parallel download completed; false if should fall back to single stream */
+    private static boolean tryParallelDownload(String url, String userAgent, File dest,
+                                               String label, ProgressListener listener) {
+        long total = probeContentLength(url, userAgent);
+        if (total < PARALLEL_MIN_BYTES) return false;
+        ExecutorService pool = Executors.newFixedThreadPool(PARALLEL_PARTS);
+        try {
+            //noinspection ResultOfMethodCallIgnored
+            dest.delete();
+            try (RandomAccessFile raf = new RandomAccessFile(dest, "rw")) {
+                raf.setLength(total);
+            }
+            AtomicLong done = new AtomicLong(0);
+            AtomicLong lastReport = new AtomicLong(0);
+            List<Callable<Void>> tasks = new ArrayList<>();
+            long part = (total + PARALLEL_PARTS - 1) / PARALLEL_PARTS;
+            for (int i = 0; i < PARALLEL_PARTS; i++) {
+                final long start = i * part;
+                if (start >= total) break;
+                final long end = Math.min(total - 1, start + part - 1);
+                tasks.add(() -> {
+                    downloadRangeToFile(url, userAgent, dest, start, end);
+                    long now = done.addAndGet(end - start + 1);
+                    if (listener != null && now - lastReport.get() >= 1024 * 1024) {
+                        lastReport.set(now);
+                        listener.onProgress(progressText(label + "×" + PARALLEL_PARTS, now, total));
+                    }
+                    return null;
+                });
+            }
+            List<Future<Void>> futures = pool.invokeAll(tasks);
+            for (Future<Void> f : futures) f.get();
+            if (dest.length() < total) {
+                // incomplete — let caller fall back
+                //noinspection ResultOfMethodCallIgnored
+                dest.delete();
+                return false;
+            }
+            report(listener, progressText(label, total, total));
+            return true;
+        } catch (Exception e) {
+            //noinspection ResultOfMethodCallIgnored
+            dest.delete();
+            return false;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static long probeContentLength(String url, String userAgent) {
+        HttpURLConnection c = null;
+        try {
+            c = openMedia(url, userAgent);
+            c.setRequestMethod("HEAD");
+            int code = c.getResponseCode();
+            if (code >= 200 && code < 300) {
+                long len = c.getContentLengthLong();
+                if (len > 0) return len;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.disconnect();
+        }
+        // Some CDNs reject HEAD — try GET Range 0-0
+        try {
+            c = openMedia(url, userAgent);
+            c.setRequestProperty("Range", "bytes=0-0");
+            int code = c.getResponseCode();
+            String cr = c.getHeaderField("Content-Range");
+            if (cr != null) {
+                int slash = cr.lastIndexOf('/');
+                if (slash > 0) {
+                    return Long.parseLong(cr.substring(slash + 1).trim());
+                }
+            }
+            if (code >= 200 && code < 300) return c.getContentLengthLong();
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.disconnect();
+        }
+        return -1;
+    }
+
+    private static void downloadRangeToFile(String url, String userAgent, File dest, long start, long end)
+            throws Exception {
+        HttpURLConnection connection = openMedia(url, userAgent);
+        connection.setRequestProperty("Range", "bytes=" + start + "-" + end);
+        try {
+            int code = connection.getResponseCode();
+            if (code != 206 && code != 200) {
+                throw new java.io.IOException("Range HTTP " + code);
+            }
+            try (InputStream in = connection.getInputStream();
+                 RandomAccessFile raf = new RandomAccessFile(dest, "rw")) {
+                raf.seek(start);
+                byte[] buffer = new byte[256 * 1024];
+                long remaining = end - start + 1;
+                while (remaining > 0) {
+                    int n = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (n < 0) break;
+                    raf.write(buffer, 0, n);
+                    remaining -= n;
+                }
+                if (remaining > 0) throw new java.io.IOException("Range incomplete");
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static HttpURLConnection openMedia(String url, String userAgent) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setInstanceFollowRedirects(true);
+        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(READ_TIMEOUT_MS);
+        connection.setRequestProperty("User-Agent",
+                userAgent == null || userAgent.isEmpty() ? HttpDownloader.BROWSER_UA : userAgent);
+        connection.setRequestProperty("Accept", "*/*");
+        connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
+        connection.setRequestProperty("Origin", "https://www.youtube.com");
+        connection.setRequestProperty("Referer", "https://www.youtube.com/");
+        connection.setRequestProperty("Cookie", "SOCS=CAI; CONSENT=YES+");
+        return connection;
     }
 
     private static String messageOf(Exception e) {
@@ -207,18 +354,7 @@ final class MediaDownloader {
      */
     private static void copyUrlResumable(String url, String userAgent, File dest, long already,
                                          String label, ProgressListener listener) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-        connection.setInstanceFollowRedirects(true);
-        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-        connection.setReadTimeout(READ_TIMEOUT_MS);
-        connection.setRequestProperty("User-Agent",
-                userAgent == null || userAgent.isEmpty() ? HttpDownloader.BROWSER_UA : userAgent);
-        connection.setRequestProperty("Accept", "*/*");
-        connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
-        connection.setRequestProperty("Origin", "https://www.youtube.com");
-        connection.setRequestProperty("Referer", "https://www.youtube.com/");
-        // Media CDN: consent only — login cookies can break googlevideo for some clients.
-        connection.setRequestProperty("Cookie", "SOCS=CAI; CONSENT=YES+");
+        HttpURLConnection connection = openMedia(url, userAgent);
         if (already > 0) {
             connection.setRequestProperty("Range", "bytes=" + already + "-");
         }

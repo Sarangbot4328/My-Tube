@@ -137,6 +137,35 @@ final class CookieStore {
         connection.setRequestProperty("X-Goog-AuthUser", "0");
     }
 
+    /**
+     * Push saved session into WebView CookieManager so m.youtube.com shows the
+     * same logged-in account (home, subs, history) instead of our custom list.
+     */
+    static void pushToWebView() {
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            String header = isGuestMode() ? CONSENT : cookieHeader();
+            String[] hosts = {
+                    "https://www.youtube.com",
+                    "https://m.youtube.com",
+                    "https://youtube.com",
+                    "https://www.google.com",
+                    "https://accounts.google.com",
+            };
+            for (String part : header.split(";")) {
+                String c = part.trim();
+                if (c.isEmpty() || !c.contains("=")) continue;
+                for (String host : hosts) {
+                    cm.setCookie(host, c + "; path=/; Secure");
+                }
+            }
+            cm.flush();
+        } catch (Exception ignored) {
+            // WebView may not be ready yet
+        }
+    }
+
     /** Single cookie value from the stored header (first match). */
     static String cookieValue(String name) {
         if (name == null || name.isEmpty()) return "";

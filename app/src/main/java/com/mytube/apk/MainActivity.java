@@ -114,17 +114,24 @@ public final class MainActivity extends Activity {
     private TextView downloadStatus;
     private int currentScreen = SCREEN_SEARCH;
 
-    // Search screen views.
+    // YouTube site (WebView) + ad-free player overlay.
+    private YoutubeWebPane youtubeWeb;
+    private FrameLayout youtubeStage;
+    private PlayerView playerView;
+    private LinearLayout playerChrome;
+    private TextView playerTitleView;
+    private Button qualityButton;
+    private Button playerDownloadButton;
+
+    // Legacy search UI fields kept nullable for offline helpers (unused in web mode).
     private EditText searchInput;
     private LinearLayout searchRow;
     private LinearLayout sortRow;
     private TextView statusView;
     private ScrollView resultsScroll;
     private LinearLayout resultsList;
-    private PlayerView playerView;
     private LinearLayout playerBar;
     private Button downloadButton;
-    private Button qualityButton;
     private ScrollView metaScroll;
     private TextView metaView;
 
@@ -189,7 +196,7 @@ public final class MainActivity extends Activity {
             }
         });
         showScreen(SCREEN_SEARCH);
-        runSearch();
+        if (youtubeWeb != null) youtubeWeb.start();
     }
 
     private void updateQualityLabel() {
@@ -240,97 +247,158 @@ public final class MainActivity extends Activity {
         return root;
     }
 
-    // ---- Search screen -----------------------------------------------------
+    // ---- YouTube site screen (real m.youtube.com) --------------------------
 
     private LinearLayout buildSearchScreen() {
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+        screen.setBackgroundColor(Color.BLACK);
 
-        searchRow = new LinearLayout(this);
-        searchRow.setOrientation(LinearLayout.HORIZONTAL);
-        searchRow.setPadding(dp(12), dp(10), dp(12), dp(8));
-
-        searchInput = new EditText(this);
-        searchInput.setSingleLine(true);
-        searchInput.setHint("비우면 맞춤 추천 · 검색어 입력 가능");
-        searchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        searchInput.setTextColor(Color.rgb(15, 23, 42));
-        searchInput.setHintTextColor(Color.rgb(100, 116, 139));
-        searchInput.setBackgroundColor(Color.WHITE);
-        searchInput.setPadding(dp(12), 0, dp(12), 0);
-        searchInput.setOnEditorActionListener((view, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                runSearch();
-                return true;
+        youtubeStage = new FrameLayout(this);
+        youtubeWeb = new YoutubeWebPane(this);
+        youtubeWeb.setHost(new YoutubeWebPane.Host() {
+            @Override
+            public void onVideoDetected(String videoUrl, String pageTitle) {
+                // Bottom bar lives inside YoutubeWebPane; nothing else required.
             }
-            return false;
+
+            @Override
+            public void onNotVideoPage() {
+                // Keep ad-free player if user opened it; otherwise idle.
+            }
+
+            @Override
+            public void onAdFreePlay(String videoUrl, String pageTitle) {
+                playWebVideo(videoUrl, pageTitle);
+            }
+
+            @Override
+            public void onDownload(String videoUrl, String pageTitle) {
+                downloadWebVideo(videoUrl, pageTitle);
+            }
         });
-        searchRow.addView(searchInput, new LinearLayout.LayoutParams(0, dp(46), 1));
+        youtubeStage.addView(youtubeWeb, new FrameLayout.LayoutParams(-1, -1));
 
-        Button searchButton = new Button(this);
-        searchButton.setText("검색");
-        searchButton.setOnClickListener(v -> runSearch());
-        searchRow.addView(searchButton, new LinearLayout.LayoutParams(dp(78), dp(46)));
-        screen.addView(searchRow);
-
-        sortRow = new LinearLayout(this);
-        sortRow.setOrientation(LinearLayout.HORIZONTAL);
-        sortRow.setPadding(dp(10), 0, dp(10), dp(6));
-        for (SortOption option : SORTS) addSortButton(sortRow, option);
-        screen.addView(sortRow);
+        // Ad-free ExoPlayer overlay (covers the site while playing).
+        LinearLayout playerLayer = new LinearLayout(this);
+        playerLayer.setOrientation(LinearLayout.VERTICAL);
+        playerLayer.setBackgroundColor(Color.BLACK);
+        playerLayer.setVisibility(View.GONE);
+        playerLayer.setId(View.generateViewId());
 
         playerView = new PlayerView(this);
         playerView.setPlayer(player);
         playerView.setBackgroundColor(Color.BLACK);
         playerView.setShutterBackgroundColor(Color.BLACK);
         playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
-        playerView.setVisibility(View.GONE);
         playerView.setFullscreenButtonClickListener(this::setFullscreen);
-        screen.addView(playerView, new LinearLayout.LayoutParams(-1, dp(220)));
+        playerLayer.addView(playerView, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        playerBar = new LinearLayout(this);
-        playerBar.setOrientation(LinearLayout.HORIZONTAL);
-        playerBar.setGravity(Gravity.END);
-        playerBar.setPadding(dp(10), dp(4), dp(10), 0);
-        playerBar.setVisibility(View.GONE);
-        addPlayerBarButton("목록", v -> closePlayer());
-        addPlayerBarButton("팝업", v -> enterPopup());
-        qualityButton = addPlayerBarButton("화질", v -> showQualityDialog());
-        downloadButton = addPlayerBarButton("다운로드", v -> onDownloadClicked());
-        screen.addView(playerBar);
+        playerChrome = new LinearLayout(this);
+        playerChrome.setOrientation(LinearLayout.VERTICAL);
+        playerChrome.setBackgroundColor(Color.rgb(15, 15, 15));
+        playerChrome.setPadding(dp(12), dp(10), dp(12), dp(10));
 
-        metaScroll = new ScrollView(this);
-        metaScroll.setVisibility(View.GONE);
-        metaScroll.setBackgroundColor(Color.WHITE);
-        metaView = new TextView(this);
-        metaView.setTextColor(Color.rgb(30, 41, 59));
-        metaView.setTextSize(13);
-        metaView.setPadding(dp(16), dp(10), dp(16), dp(10));
-        metaView.setTextIsSelectable(true);
-        metaScroll.addView(metaView);
-        screen.addView(metaScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        playerTitleView = new TextView(this);
+        playerTitleView.setTextColor(Color.WHITE);
+        playerTitleView.setTextSize(14);
+        playerTitleView.setMaxLines(2);
+        playerTitleView.setPadding(0, 0, 0, dp(8));
+        playerChrome.addView(playerTitleView, new LinearLayout.LayoutParams(-1, -2));
 
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button closePlayer = new Button(this);
+        closePlayer.setText("목록");
+        closePlayer.setAllCaps(false);
+        closePlayer.setOnClickListener(v -> closePlayer());
+        row.addView(closePlayer, new LinearLayout.LayoutParams(0, dp(46), 1));
+
+        qualityButton = new Button(this);
+        qualityButton.setText("화질");
+        qualityButton.setAllCaps(false);
+        qualityButton.setOnClickListener(v -> showQualityDialog());
+        LinearLayout.LayoutParams qLp = new LinearLayout.LayoutParams(0, dp(46), 1);
+        qLp.setMargins(dp(6), 0, 0, 0);
+        row.addView(qualityButton, qLp);
+
+        playerDownloadButton = new Button(this);
+        playerDownloadButton.setText("다운로드");
+        playerDownloadButton.setAllCaps(false);
+        playerDownloadButton.setTextColor(Color.WHITE);
+        playerDownloadButton.setBackgroundColor(Color.rgb(220, 38, 38));
+        playerDownloadButton.setOnClickListener(v -> onDownloadClicked());
+        LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(0, dp(46), 1);
+        dLp.setMargins(dp(6), 0, 0, 0);
+        row.addView(playerDownloadButton, dLp);
+        playerChrome.addView(row, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView tip = new TextView(this);
+        tip.setText("광고 없이 재생 중 · 아래 다운로드로 저장할 수 있습니다");
+        tip.setTextColor(Color.rgb(148, 163, 184));
+        tip.setTextSize(11);
+        tip.setPadding(0, dp(6), 0, 0);
+        playerChrome.addView(tip, new LinearLayout.LayoutParams(-1, -2));
+
+        playerLayer.addView(playerChrome, new LinearLayout.LayoutParams(-1, -2));
+        playerLayer.setTag("playerLayer");
+        youtubeStage.addView(playerLayer, new FrameLayout.LayoutParams(-1, -1));
+
+        // Keep references for old helpers that still look for these (hidden/unused).
+        downloadButton = playerDownloadButton;
+        metaView = playerTitleView;
+        metaScroll = null;
+        playerBar = playerChrome;
+        searchRow = new LinearLayout(this);
+        sortRow = new LinearLayout(this);
         statusView = new TextView(this);
-        statusView.setTextColor(Color.rgb(71, 85, 105));
-        statusView.setTextSize(14);
-        statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
-        screen.addView(statusView, new LinearLayout.LayoutParams(-1, dp(42)));
-
         resultsScroll = new ScrollView(this);
         resultsList = new LinearLayout(this);
-        resultsList.setOrientation(LinearLayout.VERTICAL);
-        resultsList.setPadding(dp(10), 0, dp(10), dp(10));
-        resultsScroll.addView(resultsList);
-        resultsScroll.setOnScrollChangeListener((v, sx, sy, osx, osy) -> {
-            View child = resultsScroll.getChildAt(0);
-            if (child == null) return;
-            int remaining = child.getHeight() - (resultsScroll.getHeight() + sy);
-            if (remaining < dp(600)) maybeLoadMore();
-        });
-        screen.addView(resultsScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        searchInput = new EditText(this);
 
+        screen.addView(youtubeStage, new LinearLayout.LayoutParams(-1, 0, 1));
         return screen;
+    }
+
+    private View playerLayerView() {
+        if (youtubeStage == null) return null;
+        for (int i = 0; i < youtubeStage.getChildCount(); i++) {
+            View child = youtubeStage.getChildAt(i);
+            if ("playerLayer".equals(child.getTag())) return child;
+        }
+        return null;
+    }
+
+    private void playWebVideo(String videoUrl, String title) {
+        if (videoUrl == null || videoUrl.isEmpty()) return;
+        TubeItem item = new TubeItem(
+                title == null || title.isEmpty() ? "YouTube 영상" : title,
+                "YouTube",
+                videoUrl,
+                "",
+                true,
+                videoUrl.contains("/shorts/")
+        );
+        play(item, true);
+    }
+
+    private void downloadWebVideo(String videoUrl, String title) {
+        if (videoUrl == null || videoUrl.isEmpty()) {
+            Toast.makeText(this, "다운로드할 영상이 없습니다.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        TubeItem item = new TubeItem(
+                title == null || title.isEmpty() ? "YouTube 영상" : title,
+                "YouTube",
+                videoUrl,
+                "",
+                true,
+                videoUrl.contains("/shorts/")
+        );
+        currentItem = item;
+        onDownloadClicked();
     }
 
     private Button addPlayerBarButton(String label, View.OnClickListener onClick) {
@@ -537,8 +605,11 @@ public final class MainActivity extends Activity {
         playing = true;
         showScreen(SCREEN_SEARCH);
         showPlayingLayout(true);
-        downloadButton.setVisibility(View.GONE);
-        metaView.setText(item.title + (item.uploader.isEmpty() ? "" : "\n\n" + item.uploader) + "\n\n오프라인 재생");
+        if (playerDownloadButton != null) playerDownloadButton.setVisibility(View.GONE);
+        if (playerTitleView != null) {
+            playerTitleView.setText(item.title + (item.uploader.isEmpty() ? "" : " · " + item.uploader)
+                    + "\n오프라인 재생");
+        }
         player.setMediaItem(buildMediaItem(item.uri));
         resetDefaultQualityForNewMedia();
         player.prepare();
@@ -562,7 +633,7 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.5");
+        version.setText("버전 My Tube 1.6");
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
         version.setPadding(dp(16), 0, dp(16), dp(10));
@@ -583,8 +654,8 @@ public final class MainActivity extends Activity {
         screen.addView(cookieStatusText);
 
         TextView cookieHelp = new TextView(this);
-        cookieHelp.setText("로그인하면 (1) 차단 완화 쿠키 적용, (2) 검색창을 비웠을 때 계정 맞춤 추천 홈을 불러옵니다. "
-                + "비공개 기기에서만 로그인하세요.");
+        cookieHelp.setText("로그인하면 유튜브 탭에 실제 YouTube 사이트(내 계정 홈·구독·검색)가 열립니다. "
+                + "영상 페이지에서 하단 «광고없이 재생» / «다운로드»를 쓰세요. 비공개 기기 전용.");
         cookieHelp.setTextColor(Color.rgb(100, 116, 139));
         cookieHelp.setTextSize(12);
         cookieHelp.setPadding(dp(16), 0, dp(16), dp(8));
@@ -793,11 +864,8 @@ public final class MainActivity extends Activity {
                     } else {
                         Toast.makeText(this, "cookies.txt에서 " + count + "개 쿠키를 가져왔습니다.",
                                 Toast.LENGTH_SHORT).show();
-                        if (currentScreen == SCREEN_SEARCH
-                                && searchInput != null
-                                && searchInput.getText().toString().trim().isEmpty()) {
-                            runSearch();
-                        }
+                        CookieStore.pushToWebView();
+                        if (youtubeWeb != null) youtubeWeb.reloadWithCookies();
                     }
                 });
             } catch (Exception e) {
@@ -896,12 +964,9 @@ public final class MainActivity extends Activity {
         } else if (requestCode == REQUEST_LOGIN) {
             refreshSettings();
             if (resultCode == RESULT_OK) {
-                Toast.makeText(this, "로그인 세션이 적용되었습니다. 맞춤 추천을 불러옵니다.", Toast.LENGTH_SHORT).show();
-                if (currentScreen == SCREEN_SEARCH
-                        && searchInput != null
-                        && searchInput.getText().toString().trim().isEmpty()) {
-                    runSearch();
-                }
+                Toast.makeText(this, "로그인 적용 · 유튜브 사이트를 다시 불러옵니다.", Toast.LENGTH_SHORT).show();
+                CookieStore.pushToWebView();
+                if (youtubeWeb != null) youtubeWeb.reloadWithCookies();
             }
         } else if (requestCode == REQUEST_COOKIES_FILE && resultCode == RESULT_OK
                 && data != null && data.getData() != null) {
@@ -923,8 +988,9 @@ public final class MainActivity extends Activity {
 
     private void onNavClicked(int screen) {
         if (screen == SCREEN_SEARCH && currentScreen == SCREEN_SEARCH) {
-            // Re-tapping 유튜브 returns to the main list.
+            // Re-tapping 유튜브 closes ad-free player and goes YouTube home.
             closePlayer();
+            if (youtubeWeb != null) youtubeWeb.goHome();
         }
         if (screen != SCREEN_SEARCH && playing) {
             player.pause();
@@ -1117,8 +1183,8 @@ public final class MainActivity extends Activity {
         if (resetAutoplayHistory) autoplayPlayedKeys.clear();
         markAutoplayPlayed(item);
         showPlayingLayout(true);
-        downloadButton.setVisibility(View.VISIBLE);
-        metaView.setText("재생 준비 중: " + item.title);
+        if (playerDownloadButton != null) playerDownloadButton.setVisibility(View.VISIBLE);
+        if (playerTitleView != null) playerTitleView.setText("재생 준비 중: " + item.title);
         executor.execute(() -> {
             try {
                 PlaybackData data = ExtractorBridge.resolve(item.url);
@@ -1127,7 +1193,9 @@ public final class MainActivity extends Activity {
                 mainHandler.post(() -> {
                     preparingAutoplay = false;
                     updateKeepScreenOnForPlayer();
-                    metaView.setText("재생 실패: " + e.getMessage());
+                    if (playerTitleView != null) {
+                        playerTitleView.setText("재생 실패: " + e.getMessage());
+                    }
                     Toast.makeText(this, "재생 가능한 스트림을 찾지 못했습니다.", Toast.LENGTH_LONG).show();
                     if (!resetAutoplayHistory) maybeAutoPlayNext();
                 });
@@ -1139,8 +1207,13 @@ public final class MainActivity extends Activity {
         playing = true;
         preparingAutoplay = false;
         currentPlaybackData = data;
-        metaView.setText(buildMeta(data));
-        metaScroll.scrollTo(0, 0);
+        if (playerTitleView != null) {
+            playerTitleView.setText(data.title == null ? "" : data.title);
+        }
+        if (metaView != null && metaView != playerTitleView) {
+            metaView.setText(buildMeta(data));
+        }
+        if (metaScroll != null) metaScroll.scrollTo(0, 0);
         player.setMediaItem(buildMediaItem(data.mediaUrl));
         resetDefaultQualityForNewMedia();
         player.prepare();
@@ -1301,15 +1374,19 @@ public final class MainActivity extends Activity {
         return id.isEmpty() ? item.url : id;
     }
 
-    // Shows only the player + description (hides the search bar and result list).
+    // Ad-free player overlay over the YouTube site WebView.
     private void showPlayingLayout(boolean show) {
-        searchRow.setVisibility(show ? View.GONE : View.VISIBLE);
-        sortRow.setVisibility(show ? View.GONE : View.VISIBLE);
-        statusView.setVisibility(show ? View.GONE : View.VISIBLE);
-        resultsScroll.setVisibility(show ? View.GONE : View.VISIBLE);
-        playerView.setVisibility(show ? View.VISIBLE : View.GONE);
-        playerBar.setVisibility(show ? View.VISIBLE : View.GONE);
-        metaScroll.setVisibility(show ? View.VISIBLE : View.GONE);
+        View layer = playerLayerView();
+        if (layer != null) layer.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (playerView != null) playerView.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (playerChrome != null) playerChrome.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show && playerTitleView != null && currentItem != null) {
+            playerTitleView.setText(currentItem.title);
+        }
+        if (youtubeWeb != null) {
+            if (show) youtubeWeb.onPause();
+            else youtubeWeb.onResume();
+        }
     }
 
     private CharSequence buildMeta(PlaybackData data) {
@@ -1340,7 +1417,9 @@ public final class MainActivity extends Activity {
         player.pause();
         player.clearMediaItems();
         setKeepScreenOn(false);
-        qualityButton.setText("화질");
+        if (qualityButton != null) qualityButton.setText("화질");
+        if (playerDownloadButton != null) playerDownloadButton.setVisibility(View.VISIBLE);
+        setFullscreen(false);
         showPlayingLayout(false);
     }
 
@@ -1495,12 +1574,10 @@ public final class MainActivity extends Activity {
 
     private void applyPipLayout(boolean pip) {
         bottomNav.setVisibility(pip ? View.GONE : View.VISIBLE);
-        playerBar.setVisibility(pip ? View.GONE : (playing ? View.VISIBLE : View.GONE));
-        metaScroll.setVisibility(pip ? View.GONE : (playing ? View.VISIBLE : View.GONE));
-        playerView.setUseController(!pip);
-        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) playerView.getLayoutParams();
-        lp.height = pip ? LinearLayout.LayoutParams.MATCH_PARENT : dp(220);
-        playerView.setLayoutParams(lp);
+        if (playerChrome != null) {
+            playerChrome.setVisibility(pip ? View.GONE : (playing ? View.VISIBLE : View.GONE));
+        }
+        if (playerView != null) playerView.setUseController(!pip);
     }
 
     private void setFullscreen(boolean enter) {
@@ -1509,11 +1586,9 @@ public final class MainActivity extends Activity {
                 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 : ActivityInfo.SCREEN_ORIENTATION_USER);
         bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
-        playerBar.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
-        metaScroll.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
-        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) playerView.getLayoutParams();
-        lp.height = enter ? LinearLayout.LayoutParams.MATCH_PARENT : dp(220);
-        playerView.setLayoutParams(lp);
+        if (playerChrome != null) {
+            playerChrome.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
+        }
         applyImmersive(enter);
     }
 
@@ -1535,12 +1610,16 @@ public final class MainActivity extends Activity {
             setFullscreen(false);
             return;
         }
+        if (playing) {
+            closePlayer();
+            return;
+        }
         if (currentScreen != SCREEN_SEARCH) {
             showScreen(SCREEN_SEARCH);
             return;
         }
-        if (playing) {
-            closePlayer();
+        if (youtubeWeb != null && youtubeWeb.canGoBack()) {
+            youtubeWeb.goBack();
             return;
         }
         super.onBackPressed();
@@ -1560,6 +1639,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         setKeepScreenOn(false);
+        if (youtubeWeb != null) youtubeWeb.destroy();
         player.release();
         executor.shutdownNow();
         super.onDestroy();

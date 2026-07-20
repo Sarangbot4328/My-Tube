@@ -41,10 +41,24 @@ final class CookieStore {
 
     private static volatile Context app;
 
+    /**
+     * When true on this thread, only consent cookies are sent (no login session).
+     * Used so stream resolve can fall back if a logged-in WEB session breaks player clients.
+     */
+    private static final ThreadLocal<Boolean> GUEST_MODE = ThreadLocal.withInitial(() -> false);
+
     private CookieStore() {}
 
     static void init(Context context) {
         if (context != null) app = context.getApplicationContext();
+    }
+
+    static void setGuestMode(boolean guest) {
+        GUEST_MODE.set(guest);
+    }
+
+    static boolean isGuestMode() {
+        return Boolean.TRUE.equals(GUEST_MODE.get());
     }
 
     private static SharedPreferences prefs() {
@@ -91,17 +105,36 @@ final class CookieStore {
         return "YouTube 로그인 쿠키 사용 중 (" + source + ")" + when;
     }
 
+    /**
+     * Attach cookies only. Does NOT add SAPISIDHASH — that header must only go on
+     * WEB browse/search. Putting it on NewPipe / iOS player / media CDN breaks playback.
+     */
     static void applyTo(HttpURLConnection connection) {
+        applyTo(connection, false);
+    }
+
+    /**
+     * @param webAuth if true, also send SAPISIDHASH (home feed / WEB search only)
+     */
+    static void applyTo(HttpURLConnection connection, boolean webAuth) {
         if (connection == null) return;
+        if (isGuestMode()) {
+            connection.setRequestProperty("Cookie", CONSENT);
+            return;
+        }
         String header = cookieHeader();
         if (!header.isEmpty()) connection.setRequestProperty("Cookie", header);
-        // Logged-in WEB InnerTube (home/browse) expects SAPISIDHASH.
+        if (webAuth) applyWebAuth(connection);
+    }
+
+    /** WEB InnerTube home/browse only. */
+    static void applyWebAuth(HttpURLConnection connection) {
+        if (connection == null || isGuestMode() || !hasAuthCookies()) return;
         String auth = sapisidAuthorization();
-        if (auth != null && !auth.isEmpty()) {
-            connection.setRequestProperty("Authorization", auth);
-            connection.setRequestProperty("X-Origin", "https://www.youtube.com");
-            connection.setRequestProperty("X-Goog-AuthUser", "0");
-        }
+        if (auth == null || auth.isEmpty()) return;
+        connection.setRequestProperty("Authorization", auth);
+        connection.setRequestProperty("X-Origin", "https://www.youtube.com");
+        connection.setRequestProperty("X-Goog-AuthUser", "0");
     }
 
     /** Single cookie value from the stored header (first match). */

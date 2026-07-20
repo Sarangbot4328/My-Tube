@@ -240,7 +240,7 @@ final class ExtractorBridge {
                     + webClientContextJson() + ","
                     + "\"browseId\":\"FEwhat_to_watch\""
                     + "}";
-            String response = httpPost(itUrl, payload, itHeaders);
+            String response = httpPost(itUrl, payload, itHeaders, true);
             List<TubeItem> items = parseFeedItems(response, tab);
             continuationToken = extractContinuationToken(response);
             // Home often nests videos sparsely; pull one more page if thin.
@@ -259,7 +259,7 @@ final class ExtractorBridge {
                     + "}";
             String response;
             try {
-                response = httpPost(itUrl, payload, itHeaders);
+                response = httpPost(itUrl, payload, itHeaders, true);
             } catch (Exception e) {
                 continuationToken = "";
                 mode = MODE_DONE;
@@ -315,7 +315,7 @@ final class ExtractorBridge {
                     + "\"query\":\"" + jsonEscape(actualQuery) + "\","
                     + "\"params\":\"" + params + "\""
                     + "}";
-            String response = httpPost(itUrl, payload, itHeaders);
+            String response = httpPost(itUrl, payload, itHeaders, true);
             List<TubeItem> items = parseRendererBlocks(response, tab, actualQuery);
             sortItems(items);
             continuationToken = extractContinuationToken(response);
@@ -330,7 +330,7 @@ final class ExtractorBridge {
                     + "}";
             String response;
             try {
-                response = httpPost(itUrl, payload, itHeaders);
+                response = httpPost(itUrl, payload, itHeaders, true);
             } catch (Exception e) {
                 continuationToken = "";
                 mode = MODE_DONE;
@@ -402,24 +402,39 @@ final class ExtractorBridge {
 
     static PlaybackData resolve(String url) throws Exception {
         init();
-        // 1) Bundled NewPipe extractor. Can throw or come back empty on outdated
-        //    versions / new YouTube changes, so we must fall through on failure.
+        // Login cookies help rate-limits, but some player paths return empty
+        // streams when a WEB session is attached. Try with session, then guest.
+        PlaybackData data = resolveOnce(url);
+        if (data != null) return data;
+        if (CookieStore.hasAuthCookies()) {
+            CookieStore.setGuestMode(true);
+            try {
+                data = resolveOnce(url);
+                if (data != null) return data;
+            } finally {
+                CookieStore.setGuestMode(false);
+            }
+        }
+        throw new IllegalStateException(
+                "재생 가능한 스트림을 찾지 못했습니다. YouTube가 일시적으로 차단했을 수 있어요 — "
+                        + "잠시 후 다시 시도하거나 Wi-Fi/데이터를 전환해 보세요. "
+                        + "로그인을 썼다면 설정에서 쿠키를 지우고 다시 로그인해 보세요.");
+    }
+
+    private static PlaybackData resolveOnce(String url) {
+        // 1) Bundled NewPipe extractor.
         try {
             PlaybackData data = newPipeResolve(url);
             if (data != null) return data;
         } catch (Exception ignored) {
-            // fall through to the InnerTube player fallback
+            // fall through
         }
-
-        // 2) Fallback: ask YouTube's InnerTube player endpoint using the iOS
-        //    client, which returns a directly-playable, ad-free HLS manifest
-        //    (muxed audio+video) without any JS signature deciphering.
-        PlaybackData fallback = innerTubeResolve(url);
-        if (fallback != null) return fallback;
-
-        throw new IllegalStateException(
-                "재생 가능한 스트림을 찾지 못했습니다. YouTube가 일시적으로 차단했을 수 있어요 — "
-                        + "잠시 후 다시 시도하거나 Wi-Fi/데이터를 전환해 보세요.");
+        // 2) InnerTube player clients (ANDROID_VR / TV / iOS) — HLS/progressive.
+        try {
+            return innerTubeResolve(url);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static PlaybackData newPipeResolve(String url) throws Exception {
@@ -1190,6 +1205,15 @@ final class ExtractorBridge {
     }
 
     private static String httpPost(String url, String json, Map<String, String> extraHeaders) throws Exception {
+        return httpPost(url, json, extraHeaders, false);
+    }
+
+    /**
+     * @param webAuth true for WEB browse/search (SAPISIDHASH). false for player clients
+     *                (iOS/ANDROID_VR/TV) — auth hash + login cookies there often empty streams.
+     */
+    private static String httpPost(String url, String json, Map<String, String> extraHeaders, boolean webAuth)
+            throws Exception {
         RequestPacer.beforeApiCall();
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
@@ -1203,15 +1227,21 @@ final class ExtractorBridge {
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
         connection.setRequestProperty("Origin", "https://www.youtube.com");
         connection.setRequestProperty("Referer", "https://www.youtube.com/");
-        CookieStore.applyTo(connection);
+        // Player clients: consent only (guest). WEB search/home: full session (+ optional hash).
+        if (webAuth) {
+            CookieStore.applyTo(connection, true);
+        } else {
+            connection.setRequestProperty("Cookie", "SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+000");
+        }
         if (extraHeaders != null) {
             for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
-                // Keep session Cookie from CookieStore; client UA may override below.
-                if ("Cookie".equalsIgnoreCase(entry.getKey()) && CookieStore.hasAuthCookies()) continue;
+                if ("Cookie".equalsIgnoreCase(entry.getKey()) && webAuth && CookieStore.hasAuthCookies()) {
+                    continue;
+                }
                 connection.setRequestProperty(entry.getKey(), entry.getValue());
             }
         }
-        if (CookieStore.hasAuthCookies()) CookieStore.applyTo(connection);
+        if (webAuth && CookieStore.hasAuthCookies()) CookieStore.applyTo(connection, true);
         connection.getOutputStream().write(body);
         InputStream input = connection.getResponseCode() >= 400
                 ? connection.getErrorStream()

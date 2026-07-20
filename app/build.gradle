@@ -2,6 +2,12 @@ plugins {
     id "com.android.application"
 }
 
+def signingPath = System.getenv("ANDROID_KEYSTORE_PATH")?.trim()
+def signingStorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: ""
+def signingAlias = System.getenv("ANDROID_KEY_ALIAS") ?: ""
+def signingKeyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: ""
+def hasReleaseSigning = signingPath != null && !signingPath.isEmpty()
+
 android {
     namespace "com.mytube.apk"
     compileSdk 35
@@ -10,8 +16,36 @@ android {
         applicationId "com.mytube.apk"
         minSdk 26
         targetSdk 35
-        versionCode 5
-        versionName "1.4"
+        versionCode 6
+        versionName "1.5"
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            githubRelease {
+                storeFile file(signingPath)
+                storePassword signingStorePassword
+                keyAlias signingAlias
+                keyPassword signingKeyPassword
+                // PowerShell/OpenSSL PKCS12 (.p12) or JKS both work; default PKCS12
+                // because SIGNING_SETUP / local helper generate .p12.
+                storeType (System.getenv("ANDROID_KEYSTORE_TYPE") ?: "pkcs12")
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Same applicationId as release so you can test, but debug CI builds
+            // use a random debug key → cannot update over a previous debug install.
+            // Prefer the signed release artifact for day-to-day installs.
+        }
+        release {
+            minifyEnabled false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.githubRelease
+            }
+        }
     }
 
     compileOptions {

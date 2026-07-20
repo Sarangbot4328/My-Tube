@@ -21,6 +21,14 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONTokener;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
 /**
  * Real YouTube site (m.youtube.com). On watch/shorts pages shows a bottom bar:
  * «광고없이 재생» (full app player) + «대기열 등록».
@@ -32,7 +40,7 @@ final class YoutubeWebPane extends LinearLayout {
 
         void onNotVideoPage();
 
-        void onAdFreePlay(String videoUrl, String pageTitle);
+        void onAdFreePlay(String videoUrl, String pageTitle, List<TubeItem> relatedVideos);
 
         void onDownload(String videoUrl, String pageTitle);
 
@@ -228,7 +236,7 @@ final class YoutubeWebPane extends LinearLayout {
         adFree.setBackgroundColor(Color.rgb(30, 64, 175));
         adFree.setOnClickListener(v -> {
             if (host != null && !currentVideoUrl.isEmpty()) {
-                host.onAdFreePlay(currentVideoUrl, currentTitle);
+                playAdFreeWithRelatedVideos();
             }
         });
         row.addView(adFree, new LayoutParams(0, dp(48), 1));
@@ -363,6 +371,86 @@ final class YoutubeWebPane extends LinearLayout {
                     if (href.isEmpty()) return;
                     mainHandler.post(() -> onUrlMaybeVideo(href, true));
                 });
+    }
+
+    /**
+     * Takes a snapshot of the recommendation cards currently rendered on the
+     * YouTube watch page before the WebView is paused behind the native player.
+     */
+    private void playAdFreeWithRelatedVideos() {
+        if (host == null || currentVideoUrl.isEmpty()) return;
+        final String videoUrl = currentVideoUrl;
+        final String pageTitle = currentTitle;
+        if (webView == null) {
+            host.onAdFreePlay(videoUrl, pageTitle, new ArrayList<>());
+            return;
+        }
+
+        String currentId = ExtractorBridge.videoIdOf(videoUrl);
+        String js = "(function(){try{"
+                + "var currentId='" + currentId + "',seen={},out=[];"
+                + "var cards=document.querySelectorAll("
+                + "'ytm-compact-video-renderer,ytm-video-with-context-renderer,"
+                + "ytm-rich-item-renderer,ytm-reel-item-renderer,"
+                + "ytm-playlist-panel-video-renderer,ytd-compact-video-renderer,"
+                + "ytd-rich-item-renderer,yt-lockup-view-model,"
+                + "ytm-shorts-lockup-view-model,ytm-video-with-context-renderer');"
+                + "function add(a,card){if(!a||out.length>=80)return;"
+                + "var href=a.href||a.getAttribute('href')||'';"
+                + "var m=href.match(/(?:[?&]v=|\\/shorts\\/)([A-Za-z0-9_-]{11})/);"
+                + "if(!m||m[1]===currentId||seen[m[1]])return;seen[m[1]]=1;"
+                + "var n=card.querySelector('.media-item-headline,h3,[role=heading]');"
+                + "var title=((n&&(n.getAttribute('aria-label')||n.textContent))"
+                + "||a.getAttribute('aria-label')||a.title||'YouTube video')"
+                + ".replace(/\\s+/g,' ').trim();"
+                + "out.push({url:(href.indexOf('/shorts/')>=0"
+                + "?'https://www.youtube.com/shorts/':'https://www.youtube.com/watch?v=')"
+                + "+m[1],title:title});}"
+                + "for(var i=0;i<cards.length;i++){"
+                + "var links=cards[i].querySelectorAll('a[href]');"
+                + "for(var j=0;j<links.length;j++)add(links[j],cards[i]);}"
+                + "if(!out.length){var links=document.querySelectorAll("
+                + "'a[href*=\"watch?v=\"],a[href*=\"/shorts/\"]');"
+                + "for(var k=0;k<links.length;k++)add(links[k],links[k].parentElement||document.body);}"
+                + "return JSON.stringify(out);"
+                + "}catch(e){return '[]';}})()";
+        webView.evaluateJavascript(js, value -> {
+            List<TubeItem> related = parseRelatedVideos(value, videoUrl);
+            mainHandler.post(() -> {
+                if (host != null) host.onAdFreePlay(videoUrl, pageTitle, related);
+            });
+        });
+    }
+
+    private List<TubeItem> parseRelatedVideos(String value, String currentVideoUrl) {
+        List<TubeItem> items = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        String currentId = ExtractorBridge.videoIdOf(currentVideoUrl);
+        try {
+            Object decoded = new JSONTokener(value == null ? "[]" : value).nextValue();
+            String json = decoded instanceof String ? (String) decoded : String.valueOf(decoded);
+            JSONArray array = new JSONArray(json);
+            for (int i = 0; i < array.length(); i++) {
+                org.json.JSONObject entry = array.optJSONObject(i);
+                if (entry == null) continue;
+                String url = normalizeVideoUrl(entry.optString("url", ""));
+                String id = ExtractorBridge.videoIdOf(url);
+                if (id.isEmpty() || id.equals(currentId) || !seen.add(id)) continue;
+                String title = entry.optString("title", "").trim();
+                if (title.isEmpty()) title = "YouTube video";
+                items.add(new TubeItem(
+                        title,
+                        "YouTube related video",
+                        url,
+                        thumbnailUrlFor(url),
+                        true,
+                        url.contains("/shorts/")
+                ));
+            }
+        } catch (Exception ignored) {
+            // A YouTube DOM change must not prevent the selected video from playing.
+        }
+        return items;
     }
 
     private void onUrlMaybeVideo(String url, boolean finished) {

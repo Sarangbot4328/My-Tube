@@ -24,9 +24,11 @@ import java.nio.ByteBuffer;
 // straight to disk; adaptive qualities download video and audio separately and
 // combine MP4/H.264 or WebM/VP9 streams with the OS MediaMuxer (no ffmpeg needed).
 final class MediaDownloader {
-    private static final int CONNECT_TIMEOUT_MS = 45_000;
-    private static final int READ_TIMEOUT_MS = 180_000;
+    private static final int CONNECT_TIMEOUT_MS = 30_000;
+    private static final int READ_TIMEOUT_MS = 45_000;
     private static final int MAX_ATTEMPTS = 3;
+    private static final int MAX_CONSECUTIVE_STALLS = 4;
+    private static final long RANGE_CHUNK_BYTES = 8L * 1024 * 1024;
 
     interface ProgressListener {
         void onProgress(String status);
@@ -122,6 +124,22 @@ final class MediaDownloader {
 
     private static void downloadToFile(String url, String userAgent, File dest, String label,
                                        ProgressListener listener) throws Exception {
+        long rangeTotal = -1L;
+        try {
+            rangeTotal = probeRangeTotal(url, userAgent);
+        } catch (Exception probeError) {
+            String message = messageOf(probeError);
+            if (requiresFreshUrl(probeError) || message.contains("http 429")) throw probeError;
+            // A server that rejects the one-byte probe may still allow a normal GET.
+        }
+        if (rangeTotal > 0L) {
+            copyUrlInSequentialChunks(url, userAgent, dest, rangeTotal, label, listener);
+            if (dest.length() != rangeTotal) {
+                throw new java.io.EOFException("다운로드 크기가 원본과 일치하지 않습니다.");
+            }
+            return;
+        }
+
         Exception last = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
@@ -153,6 +171,7 @@ final class MediaDownloader {
         connection.setRequestProperty("User-Agent",
                 userAgent == null || userAgent.isEmpty() ? HttpDownloader.BROWSER_UA : userAgent);
         connection.setRequestProperty("Accept", "*/*");
+        connection.setRequestProperty("Accept-Encoding", "identity");
         connection.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.5");
         connection.setRequestProperty("Origin", "https://www.youtube.com");
         connection.setRequestProperty("Referer", "https://www.youtube.com/");
@@ -162,11 +181,139 @@ final class MediaDownloader {
         return connection;
     }
 
+    /** Returns the full size only when the CDN confirms byte-range support. */
+    private static long probeRangeTotal(String url, String userAgent) throws Exception {
+        HttpURLConnection connection = openMedia(url, userAgent);
+        connection.setRequestProperty("Range", "bytes=0-0");
+        connection.setRequestProperty("Connection", "close");
+        try {
+            int code = connection.getResponseCode();
+            if (code >= 400) {
+                throw new java.io.IOException("서버 응답 오류 (HTTP " + code + ")");
+            }
+            if (code != 206) return -1L;
+            return totalFromContentRange(connection.getHeaderField("Content-Range"));
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    /**
+     * Downloads one bounded Range at a time. There is never more than one active
+     * CDN connection, but a stalled 4K transfer can reconnect from the exact byte
+     * already written instead of waiting on one huge response for several minutes.
+     */
+    private static void copyUrlInSequentialChunks(String url, String userAgent, File dest,
+                                                  long total, String label,
+                                                  ProgressListener listener) throws Exception {
+        if (dest.length() > total) {
+            try (RandomAccessFile raf = new RandomAccessFile(dest, "rw")) {
+                raf.setLength(0L);
+            }
+        }
+        long done = dest.length();
+        long[] lastReport = {done};
+        int consecutiveStalls = 0;
+
+        while (done < total) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("다운로드가 중단되었습니다.");
+            }
+            long before = done;
+            long end = Math.min(total - 1L, done + RANGE_CHUNK_BYTES - 1L);
+            try {
+                done = downloadRangeChunk(url, userAgent, dest, done, end, total,
+                        label, listener, lastReport);
+                consecutiveStalls = 0;
+            } catch (Exception error) {
+                long written = Math.min(dest.length(), total);
+                // Meaningful forward progress should not consume a stall attempt.
+                boolean advanced = written - before >= 64L * 1024L;
+                if (advanced) {
+                    consecutiveStalls = 0;
+                } else {
+                    consecutiveStalls++;
+                }
+                done = written;
+                if (!isRetryable(error) || consecutiveStalls >= MAX_CONSECUTIVE_STALLS) {
+                    throw error;
+                }
+                report(listener, progressText(label, done, total) + (advanced
+                        ? " · 다음 구간 이어받는 중…"
+                        : " · 연결 복구 중 (" + consecutiveStalls
+                                + "/" + MAX_CONSECUTIVE_STALLS + ")…"));
+                try {
+                    Thread.sleep(advanced ? 100L : 750L * consecutiveStalls);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                }
+            }
+        }
+        report(listener, progressText(label, total, total));
+    }
+
+    private static long downloadRangeChunk(String url, String userAgent, File dest,
+                                           long start, long end, long total, String label,
+                                           ProgressListener listener, long[] lastReport)
+            throws Exception {
+        HttpURLConnection connection = openMedia(url, userAgent);
+        connection.setRequestProperty("Range", "bytes=" + start + "-" + end);
+        connection.setRequestProperty("Connection", "close");
+        try {
+            int code = connection.getResponseCode();
+            if (code == 416 && start == total) return total;
+            if (code >= 400) {
+                throw new java.io.IOException("서버 응답 오류 (HTTP " + code + ")");
+            }
+            if (code != 206) {
+                throw new java.io.IOException("서버가 이어받기 요청을 거부했습니다 (HTTP " + code + ")");
+            }
+            long responseStart = startFromContentRange(connection.getHeaderField("Content-Range"));
+            if (responseStart >= 0L && responseStart != start) {
+                throw new java.io.IOException("서버의 이어받기 위치가 일치하지 않습니다.");
+            }
+
+            long current = start;
+            long remaining = end - start + 1L;
+            try (InputStream in = connection.getInputStream();
+                 RandomAccessFile raf = new RandomAccessFile(dest, "rw")) {
+                raf.setLength(start);
+                raf.seek(start);
+                byte[] buffer = new byte[128 * 1024];
+                while (remaining > 0L) {
+                    int read = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (read < 0) break;
+                    raf.write(buffer, 0, read);
+                    current += read;
+                    remaining -= read;
+                    if (listener != null && current - lastReport[0] >= 1024 * 1024) {
+                        lastReport[0] = current;
+                        listener.onProgress(progressText(label, current, total));
+                    }
+                }
+            }
+            if (remaining > 0L) {
+                throw new java.io.EOFException("구간 연결이 예상보다 일찍 종료되었습니다.");
+            }
+            return current;
+        } finally {
+            connection.disconnect();
+        }
+    }
+
     private static String messageOf(Exception e) {
         return e.getMessage() == null ? "" : e.getMessage().toLowerCase();
     }
 
     private static boolean isRetryable(Exception e) {
+        if (e instanceof java.io.EOFException
+                || e instanceof java.net.SocketTimeoutException
+                || e instanceof java.net.ConnectException
+                || e instanceof java.net.SocketException
+                || e instanceof java.net.UnknownHostException) {
+            return true;
+        }
         String msg = messageOf(e);
         // 403/410 require a freshly resolved stream URL and 429 is an IP throttle;
         // repeating the same request only makes either condition worse.
@@ -178,6 +325,8 @@ final class MediaDownloader {
                 || msg.contains("connection")
                 || msg.contains("reset")
                 || msg.contains("eof")
+                || msg.contains("unexpected end of stream")
+                || msg.contains("premature")
                 || msg.contains("broken pipe")
                 || msg.contains("unable to resolve")
                 || msg.contains("network");
@@ -283,6 +432,18 @@ final class MediaDownloader {
         if (slash < 0 || slash + 1 >= value.length()) return -1L;
         try {
             return Long.parseLong(value.substring(slash + 1).trim());
+        } catch (NumberFormatException ignored) {
+            return -1L;
+        }
+    }
+
+    private static long startFromContentRange(String value) {
+        if (value == null) return -1L;
+        int space = value.indexOf(' ');
+        int dash = value.indexOf('-', space + 1);
+        if (space < 0 || dash <= space + 1) return -1L;
+        try {
+            return Long.parseLong(value.substring(space + 1, dash).trim());
         } catch (NumberFormatException ignored) {
             return -1L;
         }

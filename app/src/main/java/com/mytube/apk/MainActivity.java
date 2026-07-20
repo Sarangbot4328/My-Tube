@@ -102,9 +102,20 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable offlinePositionSaver = new Runnable() {
+        @Override
+        public void run() {
+            if (!offlinePlaying || currentOfflineItemId.isEmpty()) return;
+            persistOfflinePlaybackPosition();
+            if (player != null && player.isPlaying()) {
+                mainHandler.postDelayed(this, 5_000L);
+            }
+        }
+    };
     private final List<Button> sortButtons = new ArrayList<>();
     private final List<Button> navButtons = new ArrayList<>();
     private final List<TubeItem> results = new ArrayList<>();
+    private final List<TubeItem> webRelatedResults = new ArrayList<>();
 
     private ImageLoader imageLoader;
     private ExoPlayer player;
@@ -117,6 +128,7 @@ public final class MainActivity extends Activity {
     private LinearLayout appRoot;
     private TextView downloadStatus;
     private int currentScreen = SCREEN_SEARCH;
+    private int playerReturnScreen = SCREEN_SEARCH;
 
     // YouTube site (WebView) / list mode + ad-free player overlay.
     private YoutubeWebPane youtubeWeb;
@@ -172,8 +184,10 @@ public final class MainActivity extends Activity {
     private boolean offlinePlaying;
     private boolean loadingMore;
     private boolean preparingAutoplay;
+    private boolean webAutoplayActive;
     private boolean defaultQualityApplied;
     private boolean playerControlsVisible = true;
+    private String currentOfflineItemId = "";
     private int searchToken;
 
     @Override
@@ -227,6 +241,9 @@ public final class MainActivity extends Activity {
             @Override
             public void onPlaybackStateChanged(int playbackState) {
                 if (playbackState == Player.STATE_ENDED) {
+                    if (offlinePlaying && !currentOfflineItemId.isEmpty()) {
+                        DownloadStore.clearPlaybackPosition(MainActivity.this, currentOfflineItemId);
+                    }
                     maybeAutoPlayNext();
                 }
                 updateKeepScreenOnForPlayer();
@@ -234,6 +251,14 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onIsPlayingChanged(boolean isPlaying) {
+                if (offlinePlaying) {
+                    if (isPlaying) {
+                        scheduleOfflinePositionSave();
+                    } else {
+                        persistOfflinePlaybackPosition();
+                        mainHandler.removeCallbacks(offlinePositionSaver);
+                    }
+                }
                 updateKeepScreenOnForPlayer();
             }
         });
@@ -404,8 +429,9 @@ public final class MainActivity extends Activity {
             @Override public void onVideoDetected(String videoUrl, String pageTitle) {}
             @Override public void onNotVideoPage() {}
             @Override
-            public void onAdFreePlay(String videoUrl, String pageTitle) {
-                playWebVideo(videoUrl, pageTitle);
+            public void onAdFreePlay(String videoUrl, String pageTitle,
+                                     List<TubeItem> relatedVideos) {
+                playWebVideo(videoUrl, pageTitle, relatedVideos);
             }
             @Override
             public void onDownload(String videoUrl, String pageTitle) {
@@ -505,7 +531,7 @@ public final class MainActivity extends Activity {
     }
 
     /** Full app player (settings quality + no ads). Triggered by bottom «광고없이 재생». */
-    private void playWebVideo(String videoUrl, String title) {
+    private void playWebVideo(String videoUrl, String title, List<TubeItem> relatedVideos) {
         if (videoUrl == null || videoUrl.isEmpty()) return;
         String thumb = YoutubeWebPane.thumbnailUrlFor(videoUrl);
         TubeItem item = new TubeItem(
@@ -516,6 +542,9 @@ public final class MainActivity extends Activity {
                 true,
                 videoUrl.contains("/shorts/")
         );
+        webRelatedResults.clear();
+        if (relatedVideos != null) webRelatedResults.addAll(relatedVideos);
+        webAutoplayActive = true;
         // Force full overlay player path (not list-mode branch only).
         playFullOverlay(item, true);
     }
@@ -732,6 +761,9 @@ public final class MainActivity extends Activity {
                 .setTitle("삭제")
                 .setMessage("이 영상을 삭제할까요? 저장된 파일도 함께 삭제됩니다.")
                 .setPositiveButton("삭제", (d, w) -> {
+                    if (offlinePlaying && currentOfflineItemId.equals(item.id)) {
+                        closePlayer();
+                    }
                     DownloadItem removed = DownloadStore.remove(this, item.id);
                     if (removed != null) MediaDownloader.deleteFile(this, removed.uri);
                     refreshDownloadList();
@@ -742,11 +774,15 @@ public final class MainActivity extends Activity {
     }
 
     private void playOffline(DownloadItem item) {
+        persistOfflinePlaybackPosition();
+        mainHandler.removeCallbacks(offlinePositionSaver);
+        playerReturnScreen = currentScreen;
         currentItem = null;
         currentPlaybackData = null;
         autoplayPlayedKeys.clear();
         preparingAutoplay = false;
         offlinePlaying = true;
+        currentOfflineItemId = item.id == null ? "" : item.id;
         playing = true;
         showScreen(SCREEN_SEARCH);
         showPlayingLayout(true);
@@ -756,10 +792,26 @@ public final class MainActivity extends Activity {
                     + "\n오프라인 재생");
         }
         player.setMediaItem(buildMediaItem(item.uri));
+        long resumePosition = DownloadStore.getPlaybackPosition(this, currentOfflineItemId);
+        if (resumePosition > 0L) player.seekTo(resumePosition);
         resetDefaultQualityForNewMedia();
         player.prepare();
         player.play();
+        scheduleOfflinePositionSave();
         updateKeepScreenOnForPlayer();
+    }
+
+    private void scheduleOfflinePositionSave() {
+        mainHandler.removeCallbacks(offlinePositionSaver);
+        if (offlinePlaying && player != null && player.isPlaying()) {
+            mainHandler.postDelayed(offlinePositionSaver, 5_000L);
+        }
+    }
+
+    private void persistOfflinePlaybackPosition() {
+        if (!offlinePlaying || currentOfflineItemId.isEmpty() || player == null) return;
+        DownloadStore.setPlaybackPosition(this, currentOfflineItemId,
+                player.getCurrentPosition(), player.getDuration());
     }
 
     // ---- Settings screen ---------------------------------------------------
@@ -1218,6 +1270,8 @@ public final class MainActivity extends Activity {
             }
         }
         if (screen != SCREEN_SEARCH && playing) {
+            persistOfflinePlaybackPosition();
+            mainHandler.removeCallbacks(offlinePositionSaver);
             player.pause();
             updateKeepScreenOnForPlayer();
         }
@@ -1400,10 +1454,15 @@ public final class MainActivity extends Activity {
     }
 
     private void play(TubeItem item, boolean resetAutoplayHistory) {
+        if (resetAutoplayHistory) webAutoplayActive = false;
         playFullOverlay(item, resetAutoplayHistory);
     }
 
     private void playFullOverlay(TubeItem item, boolean resetAutoplayHistory) {
+        persistOfflinePlaybackPosition();
+        mainHandler.removeCallbacks(offlinePositionSaver);
+        playerReturnScreen = SCREEN_SEARCH;
+        currentOfflineItemId = "";
         currentItem = item;
         currentPlaybackData = null;
         offlinePlaying = false;
@@ -1547,7 +1606,8 @@ public final class MainActivity extends Activity {
     }
 
     private void maybeAutoPlayNext() {
-        if (!playing || offlinePlaying || preparingAutoplay || results.isEmpty()) return;
+        List<TubeItem> autoplayItems = currentAutoplayItems();
+        if (!playing || offlinePlaying || preparingAutoplay || autoplayItems.isEmpty()) return;
         TubeItem next = nextAutoplayItem();
         if (next == null) {
             Toast.makeText(this, "재생할 다음 영상이 없습니다.", Toast.LENGTH_SHORT).show();
@@ -1565,10 +1625,11 @@ public final class MainActivity extends Activity {
     }
 
     private TubeItem sequentialAutoplayItem() {
-        int start = currentResultIndex();
+        List<TubeItem> autoplayItems = currentAutoplayItems();
+        int start = currentAutoplayIndex(autoplayItems);
         if (start < 0) start = -1;
-        for (int i = start + 1; i < results.size(); i++) {
-            TubeItem candidate = results.get(i);
+        for (int i = start + 1; i < autoplayItems.size(); i++) {
+            TubeItem candidate = autoplayItems.get(i);
             if (isAutoplayCandidate(candidate)) return candidate;
         }
         return null;
@@ -1576,7 +1637,7 @@ public final class MainActivity extends Activity {
 
     private TubeItem randomAutoplayItem() {
         List<TubeItem> candidates = new ArrayList<>();
-        for (TubeItem item : results) {
+        for (TubeItem item : currentAutoplayItems()) {
             if (isAutoplayCandidate(item)) candidates.add(item);
         }
         if (candidates.isEmpty()) return null;
@@ -1587,11 +1648,15 @@ public final class MainActivity extends Activity {
         return item != null && item.playable && !autoplayPlayedKeys.contains(autoplayKey(item));
     }
 
-    private int currentResultIndex() {
+    private List<TubeItem> currentAutoplayItems() {
+        return webAutoplayActive ? webRelatedResults : results;
+    }
+
+    private int currentAutoplayIndex(List<TubeItem> autoplayItems) {
         if (currentItem == null) return -1;
         String currentKey = autoplayKey(currentItem);
-        for (int i = 0; i < results.size(); i++) {
-            if (currentKey.equals(autoplayKey(results.get(i)))) return i;
+        for (int i = 0; i < autoplayItems.size(); i++) {
+            if (currentKey.equals(autoplayKey(autoplayItems.get(i)))) return i;
         }
         return -1;
     }
@@ -1644,8 +1709,13 @@ public final class MainActivity extends Activity {
     }
 
     private void closePlayer() {
+        int returnScreen = playerReturnScreen;
+        persistOfflinePlaybackPosition();
+        mainHandler.removeCallbacks(offlinePositionSaver);
         playing = false;
         offlinePlaying = false;
+        currentOfflineItemId = "";
+        playerReturnScreen = SCREEN_SEARCH;
         currentItem = null;
         currentPlaybackData = null;
         autoplayPlayedKeys.clear();
@@ -1658,6 +1728,7 @@ public final class MainActivity extends Activity {
         setFullscreen(false);
         if (playerView != null) playerView.setPlayer(player);
         showPlayingLayout(false);
+        if (returnScreen != SCREEN_SEARCH) showScreen(returnScreen);
     }
 
     private void showQualityDialog() {
@@ -1812,11 +1883,8 @@ public final class MainActivity extends Activity {
         bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
         updatePlayerChromeVisibility();
         if (playerView != null) {
-            // Downloaded videos fill the display in fullscreen. ZOOM intentionally
-            // crops a small amount when the video's ratio differs from the phone.
-            playerView.setResizeMode(enter && offlinePlaying
-                    ? AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                    : AspectRatioFrameLayout.RESIZE_MODE_FIT);
+            // Preserve the complete frame and its aspect ratio in fullscreen.
+            playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
         }
         applyImmersive(enter);
     }
@@ -1914,7 +1982,15 @@ public final class MainActivity extends Activity {
     }
 
     @Override
+    protected void onStop() {
+        persistOfflinePlaybackPosition();
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
+        persistOfflinePlaybackPosition();
+        mainHandler.removeCallbacks(offlinePositionSaver);
         setKeepScreenOn(false);
         if (downloadQueue != null) downloadQueue.shutdown();
         if (youtubeWeb != null) youtubeWeb.destroy();

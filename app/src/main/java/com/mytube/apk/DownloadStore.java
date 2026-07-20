@@ -18,6 +18,7 @@ final class DownloadStore {
     private static final String KEY_NEXT_PLAY_ORDER = "next_play_order";
     private static final String KEY_DEFAULT_QUALITY = "default_quality";
     private static final String KEY_YOUTUBE_VIEW = "youtube_view_mode";
+    private static final String KEY_PLAYBACK_POSITION_PREFIX = "playback_position_";
     static final String ORDER_SEQUENTIAL = "sequential";
     static final String ORDER_RANDOM = "random";
     static final String QUALITY_LOWEST = "lowest";
@@ -88,7 +89,30 @@ final class DownloadStore {
             }
         }
         save(c, filtered);
+        clearPlaybackPosition(c, id);
         return removed;
+    }
+
+    static long getPlaybackPosition(Context c, String id) {
+        if (id == null || id.isEmpty()) return 0L;
+        return Math.max(0L, prefs(c).getLong(KEY_PLAYBACK_POSITION_PREFIX + id, 0L));
+    }
+
+    static void setPlaybackPosition(Context c, String id, long positionMs, long durationMs) {
+        if (id == null || id.isEmpty()) return;
+        String key = KEY_PLAYBACK_POSITION_PREFIX + id;
+        // Ignore accidental starts. A video watched to within 15 seconds of its
+        // end is considered complete and starts from the beginning next time.
+        if (positionMs < 3_000L || (durationMs > 0L && positionMs >= durationMs - 15_000L)) {
+            prefs(c).edit().remove(key).apply();
+        } else {
+            prefs(c).edit().putLong(key, positionMs).apply();
+        }
+    }
+
+    static void clearPlaybackPosition(Context c, String id) {
+        if (id == null || id.isEmpty()) return;
+        prefs(c).edit().remove(KEY_PLAYBACK_POSITION_PREFIX + id).apply();
     }
 
     private static void save(Context c, List<DownloadItem> items) {

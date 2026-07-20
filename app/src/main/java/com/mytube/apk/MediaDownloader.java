@@ -26,10 +26,10 @@ import java.nio.ByteBuffer;
 final class MediaDownloader {
     private static final int CONNECT_TIMEOUT_MS = 30_000;
     private static final int READ_TIMEOUT_MS = 45_000;
-    private static final int MAX_ATTEMPTS = 8;
+    private static final int MAX_ATTEMPTS = 50;
     private static final int STALLS_BEFORE_URL_REFRESH = 3;
     private static final int MAX_CONSECUTIVE_STALLS = 10;
-    private static final int MAX_SOURCE_REFRESHES = 5;
+    private static final int MAX_SOURCE_REFRESHES = 16;
     private static final long RANGE_CHUNK_BYTES = 16L * 1024 * 1024;
 
     interface ProgressListener {
@@ -193,14 +193,19 @@ final class MediaDownloader {
         int consecutiveStalls = 0;
         int sourceRefreshes = 0;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            long before = dest.exists() ? dest.length() : 0L;
             try {
-                long already = dest.exists() ? dest.length() : 0L;
-                copyUrlResumable(source.url, source.userAgent, dest, already, label, listener);
+                copyUrlResumable(source.url, source.userAgent, dest, before, label, listener);
                 if (dest.length() <= 0) throw new java.io.IOException("받은 데이터가 비어 있습니다.");
                 return;
             } catch (Exception e) {
                 last = e;
-                if (isRetryable(e)) consecutiveStalls++;
+                boolean advanced = dest.length() - before >= 64L * 1024L;
+                if (advanced) {
+                    consecutiveStalls = 0;
+                } else if (isRetryable(e)) {
+                    consecutiveStalls++;
+                }
                 boolean shouldRefresh = requiresFreshUrl(e)
                         || consecutiveStalls >= STALLS_BEFORE_URL_REFRESH;
                 if (shouldRefresh && sourceRefreshes < MAX_SOURCE_REFRESHES) {
@@ -218,7 +223,7 @@ final class MediaDownloader {
                 report(listener, "연결이 끊겨 이어받는 중 (" + (attempt + 1)
                         + "/" + MAX_ATTEMPTS + ")…");
                 try {
-                    Thread.sleep(1_000L * attempt);
+                    Thread.sleep(advanced ? 100L : Math.min(5_000L, 1_000L * attempt));
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     throw e;

@@ -1,5 +1,7 @@
 package com.mytube.apk;
 
+import android.os.Build;
+
 import org.schabi.newpipe.extractor.Image;
 import org.schabi.newpipe.extractor.InfoItem;
 import org.schabi.newpipe.extractor.ListExtractor;
@@ -32,6 +34,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -532,8 +535,8 @@ final class ExtractorBridge {
     }
 
     // A downloadable quality. When muxed==false, videoUrl is a complete progressive
-    // file. When muxed==true, videoUrl (mp4/H.264, video-only) must be combined with
-    // audioUrl (m4a/AAC) into one mp4 — this is how 1080p+ is delivered.
+    // file. When muxed==true, the separate video and audio streams are combined into
+    // either MP4 (H.264/AAC) or WebM (VP9/Opus). YouTube normally uses WebM for 4K.
     // userAgent must match the client that issued the stream URL (403 otherwise).
     static final class DownloadOption {
         final String label;      // e.g. "1080p"
@@ -558,10 +561,9 @@ final class ExtractorBridge {
         }
     }
 
-    // Lists downloadable qualities: progressive (single file) plus adaptive mp4
-    // video paired with the best m4a audio for 1080p and above (combined locally
-    // with MediaMuxer). Only mp4/H.264 video is offered for muxing so it remuxes
-    // cleanly into an mp4 container.
+    // Lists downloadable qualities: progressive (single file), adaptive MP4, and
+    // adaptive VP9 WebM up to 4K. Android can mux VP9 into WebM from API 24 and
+    // Opus audio into WebM from API 29, so Opus-based 4K is offered on API 29+.
     static List<DownloadOption> downloadOptions(String url) throws Exception {
         init();
         // Prefer NewPipe: it resolves de-throttled, deciphered stream URLs for the
@@ -605,35 +607,71 @@ final class ExtractorBridge {
             String streamUrl = vs.getContent();
             if (streamUrl == null || streamUrl.isEmpty()) continue;
             int height = parseHeight(vs.getResolution());
+            String ext = suffixOf(vs.getFormat());
             byHeight.put(height, new DownloadOption(
                     resolutionLabel(vs.getResolution(), height), streamUrl, null,
-                    suffixOf(vs.getFormat()), "video/mp4", false, height, ua));
+                    ext, "webm".equalsIgnoreCase(ext) ? "video/webm" : "video/mp4",
+                    false, height, ua));
         }
 
-        // Best AAC (m4a) audio track to pair with adaptive mp4 video (1080p+).
-        AudioStream bestAudio = null;
+        AudioStream bestM4aAudio = null;
+        AudioStream bestWebmAudio = null;
         for (AudioStream as : info.getAudioStreams()) {
             if (!as.isUrl() || as.getContent() == null || as.getContent().isEmpty()) continue;
-            if (as.getFormat() != MediaFormat.M4A) continue;
-            if (bestAudio == null || as.getAverageBitrate() > bestAudio.getAverageBitrate()) bestAudio = as;
+            if (as.getFormat() == MediaFormat.M4A) {
+                if (bestM4aAudio == null
+                        || as.getAverageBitrate() > bestM4aAudio.getAverageBitrate()) {
+                    bestM4aAudio = as;
+                }
+            } else if (isMuxableWebmAudio(as)) {
+                if (bestWebmAudio == null
+                        || as.getAverageBitrate() > bestWebmAudio.getAverageBitrate()) {
+                    bestWebmAudio = as;
+                }
+            }
         }
 
-        if (bestAudio != null) {
-            for (VideoStream vs : info.getVideoOnlyStreams()) {
-                if (!vs.isUrl() || vs.getFormat() != MediaFormat.MPEG_4) continue;   // H.264 mp4 only
-                String streamUrl = vs.getContent();
-                if (streamUrl == null || streamUrl.isEmpty()) continue;
-                int height = parseHeight(vs.getResolution());
-                if (byHeight.containsKey(height)) continue;   // progressive already covers it
+        for (VideoStream vs : info.getVideoOnlyStreams()) {
+            if (!vs.isUrl()) continue;
+            String streamUrl = vs.getContent();
+            if (streamUrl == null || streamUrl.isEmpty()) continue;
+            int height = parseHeight(vs.getResolution());
+            if (byHeight.containsKey(height)) continue;   // progressive already covers it
+
+            if (vs.getFormat() == MediaFormat.MPEG_4 && bestM4aAudio != null) {
                 byHeight.put(height, new DownloadOption(
-                        resolutionLabel(vs.getResolution(), height), streamUrl, bestAudio.getContent(),
+                        resolutionLabel(vs.getResolution(), height), streamUrl, bestM4aAudio.getContent(),
                         "mp4", "video/mp4", true, height, ua));
+            } else if (vs.getFormat() == MediaFormat.WEBM
+                    && bestWebmAudio != null && isVp8OrVp9(vs.getCodec())) {
+                byHeight.put(height, new DownloadOption(
+                        resolutionLabel(vs.getResolution(), height), streamUrl, bestWebmAudio.getContent(),
+                        "webm", "video/webm", true, height, ua));
             }
         }
 
         List<DownloadOption> options = new ArrayList<>(byHeight.values());
         options.sort((a, b) -> Integer.compare(b.height, a.height));
         return options;
+    }
+
+    private static boolean isMuxableWebmAudio(AudioStream stream) {
+        MediaFormat format = stream.getFormat();
+        if (format != MediaFormat.WEBMA && format != MediaFormat.WEBMA_OPUS
+                && format != MediaFormat.OPUS) {
+            return false;
+        }
+        String codec = stream.getCodec() == null ? "" : stream.getCodec().toLowerCase(Locale.US);
+        boolean opus = format == MediaFormat.WEBMA_OPUS || format == MediaFormat.OPUS
+                || codec.contains("opus");
+        return !opus || Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
+    }
+
+    private static boolean isVp8OrVp9(String codec) {
+        if (codec == null) return false;
+        String value = codec.toLowerCase(Locale.US);
+        return value.startsWith("vp8") || value.startsWith("vp08")
+                || value.startsWith("vp9") || value.startsWith("vp09");
     }
 
     private static int parseHeight(String resolution) {
@@ -682,42 +720,66 @@ final class ExtractorBridge {
             String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
             String ext = mime.contains("webm") ? "webm" : "mp4";
             byHeight.put(height, new DownloadOption(
-                    qualityLabel(obj, height), streamUrl, null, ext, "video/mp4", false, height, userAgent));
+                    qualityLabel(obj, height), streamUrl, null, ext,
+                    "webm".equals(ext) ? "video/webm" : "video/mp4",
+                    false, height, userAgent));
         }
 
-        // Best m4a audio track to pair with adaptive video.
-        String bestAudioUrl = "";
-        int bestAudioBitrate = -1;
+        // Best audio track for each output container.
+        String bestM4aAudioUrl = "";
+        int bestM4aAudioBitrate = -1;
+        String bestWebmAudioUrl = "";
+        int bestWebmAudioBitrate = -1;
         for (String obj : jsonArrayObjects(response, "adaptiveFormats")) {
             String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
-            if (!mime.startsWith("audio/mp4")) continue;
             String audioUrl = cleanUrl(match(obj, "\"url\":\"([^\"]+)\""));
             if (audioUrl.isEmpty()) continue;
             int bitrate = intOf(match(obj, "\"bitrate\":(\\d+)"));
-            if (bitrate > bestAudioBitrate) {
-                bestAudioBitrate = bitrate;
-                bestAudioUrl = audioUrl;
+            if (mime.startsWith("audio/mp4") && bitrate > bestM4aAudioBitrate) {
+                bestM4aAudioBitrate = bitrate;
+                bestM4aAudioUrl = audioUrl;
+            } else if (mime.startsWith("audio/webm")
+                    && webmAudioSupportedByPlatform(obj) && bitrate > bestWebmAudioBitrate) {
+                bestWebmAudioBitrate = bitrate;
+                bestWebmAudioUrl = audioUrl;
             }
         }
 
-        if (!bestAudioUrl.isEmpty()) {
-            for (String obj : jsonArrayObjects(response, "adaptiveFormats")) {
-                String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
-                // H.264 in mp4 only — MediaMuxer remuxes it cleanly (skip VP9/AV1).
-                if (!mime.startsWith("video/mp4") || !mime.contains("avc1")) continue;
-                String videoUrl = cleanUrl(match(obj, "\"url\":\"([^\"]+)\""));
-                if (videoUrl.isEmpty()) continue;
-                int height = intOf(match(obj, "\"height\":(\\d+)"));
-                if (byHeight.containsKey(height)) continue;    // progressive already covers it
+        for (String obj : jsonArrayObjects(response, "adaptiveFormats")) {
+            String mime = clean(match(obj, "\"mimeType\":\"([^\"]+)\""));
+            String videoUrl = cleanUrl(match(obj, "\"url\":\"([^\"]+)\""));
+            if (videoUrl.isEmpty()) continue;
+            int height = intOf(match(obj, "\"height\":(\\d+)"));
+            if (height <= 0 || byHeight.containsKey(height)) continue;
+
+            if (mime.startsWith("video/mp4") && obj.contains("avc1")
+                    && !bestM4aAudioUrl.isEmpty()) {
                 byHeight.put(height, new DownloadOption(
-                        qualityLabel(obj, height), videoUrl, bestAudioUrl, "mp4", "video/mp4", true, height,
-                        userAgent));
+                        qualityLabel(obj, height), videoUrl, bestM4aAudioUrl,
+                        "mp4", "video/mp4", true, height, userAgent));
+            } else if (mime.startsWith("video/webm") && containsVp8OrVp9Codec(obj)
+                    && !bestWebmAudioUrl.isEmpty()) {
+                byHeight.put(height, new DownloadOption(
+                        qualityLabel(obj, height), videoUrl, bestWebmAudioUrl,
+                        "webm", "video/webm", true, height, userAgent));
             }
         }
 
         List<DownloadOption> options = new ArrayList<>(byHeight.values());
         options.sort((a, b) -> Integer.compare(b.height, a.height));
         return options;
+    }
+
+    private static boolean webmAudioSupportedByPlatform(String formatJson) {
+        boolean opus = formatJson != null && formatJson.toLowerCase(Locale.US).contains("opus");
+        return !opus || Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
+    }
+
+    private static boolean containsVp8OrVp9Codec(String formatJson) {
+        if (formatJson == null) return false;
+        String value = formatJson.toLowerCase(Locale.US);
+        return value.contains("vp8") || value.contains("vp08")
+                || value.contains("vp9") || value.contains("vp09");
     }
 
     private static String qualityLabel(String obj, int height) {

@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -172,6 +173,7 @@ public final class MainActivity extends Activity {
     private boolean loadingMore;
     private boolean preparingAutoplay;
     private boolean defaultQualityApplied;
+    private boolean playerControlsVisible = true;
     private int searchToken;
 
     @Override
@@ -324,56 +326,53 @@ public final class MainActivity extends Activity {
         playerView.setShutterBackgroundColor(Color.BLACK);
         playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
         playerView.setFullscreenButtonClickListener(this::setFullscreen);
+        playerView.setControllerShowTimeoutMs(3_500);
         playerLayer.addView(playerView, new LinearLayout.LayoutParams(-1, 0, 1));
 
         playerChrome = new LinearLayout(this);
-        playerChrome.setOrientation(LinearLayout.VERTICAL);
-        playerChrome.setBackgroundColor(Color.rgb(15, 15, 15));
-        playerChrome.setPadding(dp(12), dp(10), dp(12), dp(10));
+        playerChrome.setOrientation(LinearLayout.HORIZONTAL);
+        playerChrome.setGravity(Gravity.CENTER_VERTICAL);
+        playerChrome.setPadding(dp(8), dp(6), dp(8), dp(14));
+        GradientDrawable chromeFade = new GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{Color.argb(235, 0, 0, 0), Color.argb(175, 0, 0, 0), Color.TRANSPARENT});
+        playerChrome.setBackground(chromeFade);
+
+        Button closePlayer = new Button(this);
+        closePlayer.setText("✕ 닫기");
+        styleIntegratedPlayerButton(closePlayer, Color.WHITE);
+        closePlayer.setOnClickListener(v -> closePlayer());
+        playerChrome.addView(closePlayer, new LinearLayout.LayoutParams(dp(74), dp(44)));
 
         playerTitleView = new TextView(this);
         playerTitleView.setTextColor(Color.WHITE);
         playerTitleView.setTextSize(14);
-        playerTitleView.setMaxLines(2);
-        playerTitleView.setPadding(0, 0, 0, dp(8));
-        playerChrome.addView(playerTitleView, new LinearLayout.LayoutParams(-1, -2));
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-
-        Button closePlayer = new Button(this);
-        closePlayer.setText("닫기");
-        closePlayer.setAllCaps(false);
-        closePlayer.setOnClickListener(v -> closePlayer());
-        row.addView(closePlayer, new LinearLayout.LayoutParams(0, dp(46), 1));
+        playerTitleView.setSingleLine(true);
+        playerTitleView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        playerTitleView.setPadding(dp(6), 0, dp(6), 0);
+        playerChrome.addView(playerTitleView, new LinearLayout.LayoutParams(0, dp(44), 1));
 
         qualityButton = new Button(this);
         qualityButton.setText("화질");
-        qualityButton.setAllCaps(false);
+        styleIntegratedPlayerButton(qualityButton, Color.WHITE);
         qualityButton.setOnClickListener(v -> showQualityDialog());
-        LinearLayout.LayoutParams qLp = new LinearLayout.LayoutParams(0, dp(46), 1);
-        qLp.setMargins(dp(6), 0, 0, 0);
-        row.addView(qualityButton, qLp);
+        playerChrome.addView(qualityButton, new LinearLayout.LayoutParams(dp(86), dp(44)));
 
         playerDownloadButton = new Button(this);
-        playerDownloadButton.setText("대기열 등록");
-        playerDownloadButton.setAllCaps(false);
-        playerDownloadButton.setTextColor(Color.WHITE);
-        playerDownloadButton.setBackgroundColor(Color.rgb(220, 38, 38));
+        playerDownloadButton.setText("저장");
+        styleIntegratedPlayerButton(playerDownloadButton, Color.rgb(255, 145, 145));
         playerDownloadButton.setOnClickListener(v -> onDownloadClicked());
-        LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(0, dp(46), 1);
-        dLp.setMargins(dp(6), 0, 0, 0);
-        row.addView(playerDownloadButton, dLp);
-        playerChrome.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        playerChrome.addView(playerDownloadButton, new LinearLayout.LayoutParams(dp(64), dp(44)));
 
-        TextView tip = new TextView(this);
-        tip.setText("광고 없이 재생 중 · 설정 화질 적용 · «대기열 등록» 가능");
-        tip.setTextColor(Color.rgb(148, 163, 184));
-        tip.setTextSize(11);
-        tip.setPadding(0, dp(6), 0, 0);
-        playerChrome.addView(tip, new LinearLayout.LayoutParams(-1, -2));
-
-        playerLayer.addView(playerChrome, new LinearLayout.LayoutParams(-1, -2));
+        FrameLayout playerOverlay = playerView.getOverlayFrameLayout();
+        FrameLayout.LayoutParams chromeLp = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP);
+        if (playerOverlay != null) playerOverlay.addView(playerChrome, chromeLp);
+        else playerView.addView(playerChrome, chromeLp);
+        playerView.setControllerVisibilityListener(
+                (PlayerView.ControllerVisibilityListener) visibility -> {
+                    playerControlsVisible = visibility == View.VISIBLE;
+                    updatePlayerChromeVisibility();
+                });
         shell.addView(playerLayer, new FrameLayout.LayoutParams(-1, -1));
 
         downloadButton = playerDownloadButton;
@@ -382,6 +381,16 @@ public final class MainActivity extends Activity {
         playerBar = playerChrome;
 
         return screen;
+    }
+
+    private void styleIntegratedPlayerButton(Button button, int textColor) {
+        button.setAllCaps(false);
+        button.setTextColor(textColor);
+        button.setTextSize(12);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setPadding(dp(4), 0, dp(4), 0);
+        button.setBackgroundColor(Color.TRANSPARENT);
     }
 
     private LinearLayout buildWebModeRoot() {
@@ -1601,7 +1610,11 @@ public final class MainActivity extends Activity {
         View layer = playerLayerView();
         if (layer != null) layer.setVisibility(show ? View.VISIBLE : View.GONE);
         if (playerView != null) playerView.setVisibility(show ? View.VISIBLE : View.GONE);
-        if (playerChrome != null) playerChrome.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show && playerView != null) {
+            playerControlsVisible = true;
+            playerView.showController();
+        }
+        updatePlayerChromeVisibility();
         if (show && playerTitleView != null && currentItem != null) {
             playerTitleView.setText(currentItem.title);
         }
@@ -1787,10 +1800,8 @@ public final class MainActivity extends Activity {
 
     private void applyPipLayout(boolean pip) {
         bottomNav.setVisibility(pip ? View.GONE : View.VISIBLE);
-        if (playerChrome != null) {
-            playerChrome.setVisibility(pip ? View.GONE : (playing ? View.VISIBLE : View.GONE));
-        }
         if (playerView != null) playerView.setUseController(!pip);
+        updatePlayerChromeVisibility();
     }
 
     private void setFullscreen(boolean enter) {
@@ -1799,10 +1810,23 @@ public final class MainActivity extends Activity {
                 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 : ActivityInfo.SCREEN_ORIENTATION_USER);
         bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
-        if (playerChrome != null) {
-            playerChrome.setVisibility(enter ? View.GONE : (playing ? View.VISIBLE : View.GONE));
+        updatePlayerChromeVisibility();
+        if (playerView != null) {
+            // Downloaded videos fill the display in fullscreen. ZOOM intentionally
+            // crops a small amount when the video's ratio differs from the phone.
+            playerView.setResizeMode(enter && offlinePlaying
+                    ? AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    : AspectRatioFrameLayout.RESIZE_MODE_FIT);
         }
         applyImmersive(enter);
+    }
+
+    private void updatePlayerChromeVisibility() {
+        if (playerChrome == null) return;
+        boolean pip = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && isInPictureInPictureMode();
+        boolean show = playing && playerControlsVisible && !fullscreen && !pip;
+        playerChrome.setVisibility(show ? View.VISIBLE : View.GONE);
     }
 
     private void setWebFullscreen(boolean enter) {

@@ -21,8 +21,8 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 
 // Saves a chosen quality to local storage. Progressive streams are written
-// straight to disk; adaptive (1080p+) qualities download the mp4 video and m4a
-// audio separately and combine them with the OS MediaMuxer (no ffmpeg needed).
+// straight to disk; adaptive qualities download video and audio separately and
+// combine MP4/H.264 or WebM/VP9 streams with the OS MediaMuxer (no ffmpeg needed).
 final class MediaDownloader {
     private static final int CONNECT_TIMEOUT_MS = 45_000;
     private static final int READ_TIMEOUT_MS = 180_000;
@@ -50,16 +50,17 @@ final class MediaDownloader {
             try {
                 downloadToFile(option.videoUrl, option.userAgent, tmp, "다운로드", listener);
                 report(listener, "저장 중...");
-                return writeToTarget(context, fileName, "video/mp4", out -> copyFile(tmp, out));
+                return writeToTarget(context, fileName, option.mime, out -> copyFile(tmp, out));
             } finally {
                 //noinspection ResultOfMethodCallIgnored
                 tmp.delete();
             }
         }
 
-        File videoTmp = File.createTempFile("mtv", ".mp4", cache);
-        File audioTmp = File.createTempFile("mta", ".m4a", cache);
-        File muxed = File.createTempFile("mtmux", ".mp4", cache);
+        boolean webm = "webm".equalsIgnoreCase(option.ext);
+        File videoTmp = File.createTempFile("mtv", webm ? ".webm" : ".mp4", cache);
+        File audioTmp = File.createTempFile("mta", webm ? ".webm" : ".m4a", cache);
+        File muxed = File.createTempFile("mtmux", webm ? ".webm" : ".mp4", cache);
         try {
             // Keep one media connection active at a time. The previous 4-part Range
             // download combined with video/audio parallelism opened up to 8 CDN
@@ -70,7 +71,8 @@ final class MediaDownloader {
             downloadToFile(option.audioUrl, option.userAgent, audioTmp, "오디오", listener);
             report(listener, "영상·오디오 합치는 중...");
             try {
-                muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(), muxed.getAbsolutePath());
+                muxToFile(videoTmp.getAbsolutePath(), audioTmp.getAbsolutePath(),
+                        muxed.getAbsolutePath(), webm);
             } catch (Exception muxErr) {
                 throw new IllegalStateException(
                         "영상·오디오 합치기 실패: "
@@ -78,7 +80,7 @@ final class MediaDownloader {
                         muxErr);
             }
             report(listener, "저장 중...");
-            return writeToTarget(context, fileName, "video/mp4", out -> copyFile(muxed, out));
+            return writeToTarget(context, fileName, option.mime, out -> copyFile(muxed, out));
         } finally {
             //noinspection ResultOfMethodCallIgnored
             videoTmp.delete();
@@ -303,10 +305,13 @@ final class MediaDownloader {
         }
     }
 
-    private static void muxToFile(String videoPath, String audioPath, String outPath) throws Exception {
+    private static void muxToFile(String videoPath, String audioPath, String outPath,
+                                  boolean webm) throws Exception {
         MediaExtractor videoEx = new MediaExtractor();
         MediaExtractor audioEx = new MediaExtractor();
-        MediaMuxer muxer = new MediaMuxer(outPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        MediaMuxer muxer = new MediaMuxer(outPath, webm
+                ? MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+                : MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
         try {
             videoEx.setDataSource(videoPath);
             audioEx.setDataSource(audioPath);
@@ -349,9 +354,10 @@ final class MediaDownloader {
     private static int maxInputSize(MediaFormat format) {
         if (format != null && format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
             int size = format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE);
-            if (size > 0) return Math.max(size, 1024 * 1024);
+            if (size > 0) return Math.max(size, 4 * 1024 * 1024);
         }
-        return 4 * 1024 * 1024;
+        // 4K VP9 keyframes can exceed the old 4 MB fallback.
+        return 16 * 1024 * 1024;
     }
 
     private static void copySamples(MediaExtractor extractor, MediaMuxer muxer, int outTrack, int bufferSize) {

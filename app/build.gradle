@@ -12,6 +12,10 @@ android {
     namespace "com.mytube.apk"
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId "com.mytube.apk"
         minSdk 26

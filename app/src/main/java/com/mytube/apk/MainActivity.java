@@ -134,16 +134,12 @@ public final class MainActivity extends Activity {
     private YoutubeWebPane youtubeWeb;
     private FrameLayout youtubeStage;
     private LinearLayout webModeRoot;
-    private LinearLayout listModeRoot;
     private PlayerView playerView;
     private LinearLayout playerChrome;
     private LinearLayout playerLayer;
     private TextView playerTitleView;
     private Button qualityButton;
     private Button playerDownloadButton;
-    private Button viewWebButton;
-    private Button viewListButton;
-    private TextView youtubeViewModeText;
     private DownloadQueue downloadQueue;
 
     // Legacy search UI fields kept nullable for offline helpers (unused in web mode).
@@ -185,6 +181,8 @@ public final class MainActivity extends Activity {
     private boolean loadingMore;
     private boolean preparingAutoplay;
     private boolean webAutoplayActive;
+    private boolean webVideoPage;
+    private boolean webVideoPanelExpanded;
     private boolean defaultQualityApplied;
     private boolean playerControlsVisible = true;
     private String currentOfflineItemId = "";
@@ -263,7 +261,7 @@ public final class MainActivity extends Activity {
             }
         });
         showScreen(SCREEN_SEARCH);
-        applyYoutubeViewMode(false);
+        startYoutubeSite();
     }
 
     private void updateQualityLabel() {
@@ -320,10 +318,10 @@ public final class MainActivity extends Activity {
         return root;
     }
 
-    // ---- YouTube tab: web site mode OR classic list mode --------------------
+    // ---- YouTube tab: site mode --------------------------------------------
 
     private LinearLayout buildSearchScreen() {
-        // Outer shell: two modes stacked + shared ad-free player overlay.
+        // Outer shell: YouTube site + shared ad-free player overlay.
         FrameLayout shell = new FrameLayout(this);
         shell.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
         // Wrap in LinearLayout for searchScreen type field (visibility toggling).
@@ -334,9 +332,7 @@ public final class MainActivity extends Activity {
         screen.addView(shell, new LinearLayout.LayoutParams(-1, -1));
 
         webModeRoot = buildWebModeRoot();
-        listModeRoot = buildListModeRoot();
         shell.addView(webModeRoot, new FrameLayout.LayoutParams(-1, -1));
-        shell.addView(listModeRoot, new FrameLayout.LayoutParams(-1, -1));
 
         // Shared player overlay on top of either mode.
         playerLayer = new LinearLayout(this);
@@ -426,8 +422,16 @@ public final class MainActivity extends Activity {
         youtubeStage = new FrameLayout(this);
         youtubeWeb = new YoutubeWebPane(this);
         youtubeWeb.setHost(new YoutubeWebPane.Host() {
-            @Override public void onVideoDetected(String videoUrl, String pageTitle) {}
-            @Override public void onNotVideoPage() {}
+            @Override
+            public void onVideoDetected(String videoUrl, String pageTitle) {
+                webVideoPage = true;
+            }
+            @Override
+            public void onNotVideoPage() {
+                webVideoPage = false;
+                webVideoPanelExpanded = false;
+                updateBottomNavVisibility(false);
+            }
             @Override
             public void onAdFreePlay(String videoUrl, String pageTitle,
                                      List<TubeItem> relatedVideos) {
@@ -440,6 +444,13 @@ public final class MainActivity extends Activity {
             @Override
             public void onFullscreenChanged(boolean fullscreen) {
                 setWebFullscreen(fullscreen);
+            }
+            @Override
+            public void onVideoPanelChanged(
+                    boolean videoPage, boolean expanded, boolean animate) {
+                webVideoPage = videoPage;
+                webVideoPanelExpanded = expanded;
+                updateBottomNavVisibility(animate);
             }
         });
         youtubeStage.addView(youtubeWeb, new FrameLayout.LayoutParams(-1, -1));
@@ -506,28 +517,13 @@ public final class MainActivity extends Activity {
         return screen;
     }
 
-    private void applyYoutubeViewMode(boolean fromSettings) {
-        String mode = DownloadStore.getYoutubeViewMode(this);
-        boolean web = DownloadStore.VIEW_WEB.equals(mode);
-        if (webModeRoot != null) webModeRoot.setVisibility(web ? View.VISIBLE : View.GONE);
-        if (listModeRoot != null) listModeRoot.setVisibility(web ? View.GONE : View.VISIBLE);
-        if (web) {
-            if (youtubeWeb != null) youtubeWeb.start();
-        } else {
-            if (youtubeWeb != null) youtubeWeb.onPause();
-            if (fromSettings || (results != null && results.isEmpty())) {
-                runSearch();
-            }
-        }
-        refreshYoutubeViewModeUi();
+    private void startYoutubeSite() {
+        if (webModeRoot != null) webModeRoot.setVisibility(View.VISIBLE);
+        if (youtubeWeb != null) youtubeWeb.start();
     }
 
     private View playerLayerView() {
         return playerLayer;
-    }
-
-    private boolean isWebViewMode() {
-        return DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this));
     }
 
     /** Full app player (settings quality + no ads). Triggered by bottom «광고없이 재생». */
@@ -836,39 +832,6 @@ public final class MainActivity extends Activity {
         version.setPadding(dp(16), 0, dp(16), dp(10));
         screen.addView(version);
 
-        // YouTube tab view mode
-        TextView viewModeLabel = new TextView(this);
-        viewModeLabel.setText("유튜브 보기 방식");
-        viewModeLabel.setTextColor(Color.rgb(15, 23, 42));
-        viewModeLabel.setTextSize(15);
-        viewModeLabel.setPadding(dp(16), dp(6), dp(16), dp(4));
-        screen.addView(viewModeLabel);
-
-        youtubeViewModeText = new TextView(this);
-        youtubeViewModeText.setTextColor(Color.rgb(71, 85, 105));
-        youtubeViewModeText.setTextSize(13);
-        youtubeViewModeText.setPadding(dp(16), 0, dp(16), dp(8));
-        screen.addView(youtubeViewModeText);
-
-        LinearLayout viewModeRow = new LinearLayout(this);
-        viewModeRow.setOrientation(LinearLayout.HORIZONTAL);
-        viewModeRow.setPadding(dp(12), 0, dp(12), dp(12));
-
-        viewWebButton = new Button(this);
-        viewWebButton.setText("사이트 화면");
-        viewWebButton.setAllCaps(false);
-        viewWebButton.setOnClickListener(v -> setYoutubeViewMode(DownloadStore.VIEW_WEB));
-        viewModeRow.addView(viewWebButton, new LinearLayout.LayoutParams(0, dp(46), 1));
-
-        viewListButton = new Button(this);
-        viewListButton.setText("목록·검색");
-        viewListButton.setAllCaps(false);
-        viewListButton.setOnClickListener(v -> setYoutubeViewMode(DownloadStore.VIEW_LIST));
-        LinearLayout.LayoutParams listBtnLp = new LinearLayout.LayoutParams(0, dp(46), 1);
-        listBtnLp.setMargins(dp(8), 0, 0, 0);
-        viewModeRow.addView(viewListButton, listBtnLp);
-        screen.addView(viewModeRow);
-
         // Temp cleanup
         TextView tempLabel = new TextView(this);
         tempLabel.setText("저장 공간");
@@ -905,7 +868,7 @@ public final class MainActivity extends Activity {
         screen.addView(cookieStatusText);
 
         TextView cookieHelp = new TextView(this);
-        cookieHelp.setText("로그인: 차단 완화 + 사이트 화면 모드에서 내 계정 표시. "
+        cookieHelp.setText("로그인: 차단 완화 + 유튜브 사이트에서 내 계정 표시. "
                 + "다운로드는 한 번에 하나씩 대기열로 순차 진행됩니다.");
         cookieHelp.setTextColor(Color.rgb(100, 116, 139));
         cookieHelp.setTextSize(12);
@@ -1060,28 +1023,7 @@ public final class MainActivity extends Activity {
         return wrapper;
     }
 
-    private void setYoutubeViewMode(String mode) {
-        DownloadStore.setYoutubeViewMode(this, mode);
-        applyYoutubeViewMode(true);
-        Toast.makeText(this,
-                DownloadStore.VIEW_WEB.equals(mode)
-                        ? "유튜브 탭: 사이트 화면 모드"
-                        : "유튜브 탭: 목록·검색 모드",
-                Toast.LENGTH_SHORT).show();
-    }
-
-    private void refreshYoutubeViewModeUi() {
-        if (youtubeViewModeText == null) return;
-        boolean web = DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this));
-        youtubeViewModeText.setText(web
-                ? "사이트 화면: YouTube 페이지 + 하단 «광고없이 재생 / 대기열 등록»"
-                : "목록·검색: 앱 안 검색 리스트에서 재생·대기열 등록");
-        if (viewWebButton != null) styleChoiceButton(viewWebButton, web);
-        if (viewListButton != null) styleChoiceButton(viewListButton, !web);
-    }
-
     private void refreshSettings() {
-        refreshYoutubeViewModeUi();
         if (cookieStatusText != null) {
             cookieStatusText.setText(CookieStore.statusText());
             cookieStatusText.setTextColor(CookieStore.hasAuthCookies()
@@ -1261,13 +1203,8 @@ public final class MainActivity extends Activity {
 
     private void onNavClicked(int screen) {
         if (screen == SCREEN_SEARCH && currentScreen == SCREEN_SEARCH) {
-            // Re-tapping 유튜브 closes player / refreshes current mode.
             closePlayer();
-            if (DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this))) {
-                if (youtubeWeb != null) youtubeWeb.goHome();
-            } else {
-                runSearch();
-            }
+            if (youtubeWeb != null) youtubeWeb.goHome();
         }
         if (screen != SCREEN_SEARCH && playing) {
             persistOfflinePlaybackPosition();
@@ -1291,6 +1228,56 @@ public final class MainActivity extends Activity {
         }
         if (screen == SCREEN_DOWNLOADS) refreshDownloadList();
         if (screen == SCREEN_SETTINGS) refreshSettings();
+        updateBottomNavVisibility(false);
+    }
+
+    private boolean shouldShowBottomNav() {
+        boolean pip = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && isInPictureInPictureMode();
+        boolean collapsedSiteVideo = currentScreen == SCREEN_SEARCH
+                && webVideoPage
+                && !webVideoPanelExpanded
+                && !playing;
+        return !fullscreen && !webFullscreen && !pip && !collapsedSiteVideo;
+    }
+
+    private void updateBottomNavVisibility(boolean animate) {
+        if (bottomNav == null) return;
+        boolean show = shouldShowBottomNav();
+        bottomNav.animate().cancel();
+        if (show) {
+            if (animate && bottomNav.getVisibility() != View.VISIBLE) {
+                bottomNav.setAlpha(0f);
+                bottomNav.setTranslationY(dp(60));
+                bottomNav.setVisibility(View.VISIBLE);
+                bottomNav.animate()
+                        .alpha(1f)
+                        .translationY(0f)
+                        .setDuration(180)
+                        .start();
+            } else {
+                bottomNav.setVisibility(View.VISIBLE);
+                bottomNav.setAlpha(1f);
+                bottomNav.setTranslationY(0f);
+            }
+            return;
+        }
+        if (animate && bottomNav.getVisibility() == View.VISIBLE) {
+            bottomNav.animate()
+                    .alpha(0f)
+                    .translationY(dp(60))
+                    .setDuration(150)
+                    .withEndAction(() -> {
+                        if (!shouldShowBottomNav()) bottomNav.setVisibility(View.GONE);
+                        bottomNav.setAlpha(1f);
+                        bottomNav.setTranslationY(0f);
+                    })
+                    .start();
+        } else {
+            bottomNav.setVisibility(View.GONE);
+            bottomNav.setAlpha(1f);
+            bottomNav.setTranslationY(0f);
+        }
     }
 
     // ---- Search ------------------------------------------------------------
@@ -1683,11 +1670,11 @@ public final class MainActivity extends Activity {
         if (show && playerTitleView != null && currentItem != null) {
             playerTitleView.setText(currentItem.title);
         }
-        if (youtubeWeb != null
-                && DownloadStore.VIEW_WEB.equals(DownloadStore.getYoutubeViewMode(this))) {
+        if (youtubeWeb != null) {
             if (show) youtubeWeb.onPause();
             else youtubeWeb.onResume();
         }
+        updateBottomNavVisibility(false);
     }
 
     private CharSequence buildMeta(PlaybackData data) {
@@ -1859,6 +1846,8 @@ public final class MainActivity extends Activity {
     public void onUserLeaveHint() {
         if (playing && !fullscreen && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             enterPopup();
+        } else if (currentScreen == SCREEN_SEARCH && youtubeWeb != null) {
+            youtubeWeb.armBackgroundPlayback();
         }
         super.onUserLeaveHint();
     }
@@ -1870,7 +1859,7 @@ public final class MainActivity extends Activity {
     }
 
     private void applyPipLayout(boolean pip) {
-        bottomNav.setVisibility(pip ? View.GONE : View.VISIBLE);
+        updateBottomNavVisibility(false);
         if (playerView != null) playerView.setUseController(!pip);
         updatePlayerChromeVisibility();
     }
@@ -1880,7 +1869,7 @@ public final class MainActivity extends Activity {
         setRequestedOrientation(enter
                 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 : ActivityInfo.SCREEN_ORIENTATION_USER);
-        bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
+        updateBottomNavVisibility(false);
         updatePlayerChromeVisibility();
         if (playerView != null) {
             // Preserve the complete frame and its aspect ratio in fullscreen.
@@ -1906,7 +1895,7 @@ public final class MainActivity extends Activity {
         } else if (restoreDownloadStatusAfterWebFullscreen) {
             downloadStatus.setVisibility(View.VISIBLE);
         }
-        bottomNav.setVisibility(enter ? View.GONE : View.VISIBLE);
+        updateBottomNavVisibility(false);
         setRequestedOrientation(enter
                 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 : ActivityInfo.SCREEN_ORIENTATION_USER);
@@ -1979,6 +1968,21 @@ public final class MainActivity extends Activity {
             builder.setMimeType(MimeTypes.APPLICATION_MPD);
         }
         return builder.build();
+    }
+
+    @Override
+    protected void onPause() {
+        if (!playing && currentScreen == SCREEN_SEARCH && youtubeWeb != null) {
+            youtubeWeb.armBackgroundPlayback();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (youtubeWeb != null) youtubeWeb.disarmBackgroundPlayback();
+        updateBottomNavVisibility(false);
     }
 
     @Override

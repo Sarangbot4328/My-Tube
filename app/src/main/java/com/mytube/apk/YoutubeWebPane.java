@@ -48,6 +48,8 @@ final class YoutubeWebPane extends LinearLayout {
         void onDownload(String videoUrl, String pageTitle);
 
         void onFullscreenChanged(boolean fullscreen);
+
+        void onVideoPanelChanged(boolean videoPage, boolean expanded, boolean animate);
     }
 
     private static final String HOME = "https://m.youtube.com/";
@@ -223,6 +225,7 @@ final class YoutubeWebPane extends LinearLayout {
                 currentUrl = url == null ? "" : url;
                 onUrlMaybeVideo(currentUrl, true);
                 injectAdShield();
+                injectBackgroundPlayback();
                 removeLegacyDownloadFab();
             }
         });
@@ -347,6 +350,25 @@ final class YoutubeWebPane extends LinearLayout {
         if (webView != null) webView.onResume();
         mainHandler.removeCallbacks(urlPoller);
         mainHandler.postDelayed(urlPoller, 500);
+    }
+
+    void armBackgroundPlayback() {
+        if (webView == null || currentVideoUrl.isEmpty()) return;
+        webView.evaluateJavascript(
+                "(function(){try{var v=document.querySelector("
+                        + "'#movie_player video,video.html5-main-video,video');"
+                        + "if(v&&!v.paused&&!v.ended){window.__mytubeBgVideo=v;"
+                        + "window.__mytubeBgArmed=true;try{v.play()}catch(e){}}"
+                        + "}catch(e){}})();",
+                null);
+    }
+
+    void disarmBackgroundPlayback() {
+        if (webView == null) return;
+        webView.evaluateJavascript(
+                "(function(){window.__mytubeBgArmed=false;"
+                        + "window.__mytubeBgVideo=null;})()",
+                null);
     }
 
     void destroy() {
@@ -535,6 +557,9 @@ final class YoutubeWebPane extends LinearLayout {
     private void setVideoBarExpanded(boolean expanded, boolean animate) {
         if (videoBarContent == null || videoBarToggle == null) return;
         videoBarExpanded = expanded;
+        if (host != null) {
+            host.onVideoPanelChanged(!currentVideoUrl.isEmpty(), expanded, animate);
+        }
         videoBarToggle.setText(expanded ? "⌄" : "⌃");
         videoBarToggle.setContentDescription(expanded ? "재생 메뉴 닫기" : "재생 메뉴 열기");
         videoBarContent.animate().cancel();
@@ -613,6 +638,36 @@ final class YoutubeWebPane extends LinearLayout {
                 + "document.addEventListener('yt-navigate-finish',window.__mytubeAdShield,true);"
                 + "document.addEventListener('loadedmetadata',window.__mytubeAdShield,true);}"
                 + "window.__mytubeAdShield();"
+                + "}catch(e){}})();";
+        webView.evaluateJavascript(js, null);
+    }
+
+    private void injectBackgroundPlayback() {
+        if (webView == null) return;
+        String js = "(function(){try{if(window.__mytubeBgInstalled)return;"
+                + "window.__mytubeBgInstalled=true;"
+                + "var nativePause=HTMLMediaElement.prototype.pause;"
+                + "HTMLMediaElement.prototype.pause=function(){"
+                + "if(window.__mytubeBgArmed&&window.__mytubeBgVideo===this)return;"
+                + "return nativePause.apply(this,arguments);};"
+                + "window.__mytubeBgKeepAlive=function(){try{"
+                + "var v=window.__mytubeBgVideo;"
+                + "if(window.__mytubeBgArmed&&v&&!v.ended&&v.paused){"
+                + "var p=v.play();if(p&&p.catch)p.catch(function(){});}"
+                + "}catch(e){}};"
+                + "if(!window.__mytubeBgTimer){window.__mytubeBgTimer=setInterval("
+                + "window.__mytubeBgKeepAlive,750);}"
+                + "document.addEventListener('play',function(e){"
+                + "if(e.target instanceof HTMLMediaElement){"
+                + "window.__mytubeLastPlaying=e.target;}},true);"
+                + "document.addEventListener('visibilitychange',function(){"
+                + "if(document.hidden){var v=window.__mytubeLastPlaying||"
+                + "document.querySelector('#movie_player video,video.html5-main-video,video');"
+                + "if(v&&!v.paused&&!v.ended){window.__mytubeBgVideo=v;"
+                + "window.__mytubeBgArmed=true;}"
+                + "if(window.__mytubeBgArmed){"
+                + "Promise.resolve().then(window.__mytubeBgKeepAlive);"
+                + "setTimeout(window.__mytubeBgKeepAlive,100);}}},true);"
                 + "}catch(e){}})();";
         webView.evaluateJavascript(js, null);
     }

@@ -13,6 +13,7 @@ import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -25,6 +26,7 @@ import android.widget.TextView;
 import org.json.JSONArray;
 import org.json.JSONTokener;
 
+import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -191,6 +193,17 @@ final class YoutubeWebPane extends LinearLayout {
             }
         });
         webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(
+                    WebView view, WebResourceRequest request) {
+                if (request != null && request.getUrl() != null
+                        && isAdResourceUrl(request.getUrl().toString())) {
+                    return new WebResourceResponse(
+                            "text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 if (request != null && request.getUrl() != null) {
@@ -563,20 +576,60 @@ final class YoutubeWebPane extends LinearLayout {
         String js = "(function(){try{"
                 + "var css='ytd-ad-slot-renderer,.ytp-ad-module,.video-ads,"
                 + ".ytp-ad-player-overlay,.ytp-ad-overlay-container,"
+                + ".ytp-ad-image-overlay,.ytp-ad-action-interstitial,"
+                + ".ytp-ad-player-overlay-instream-info,.ytp-ad-survey,"
                 + "ytd-promoted-sparkles-web-renderer,ytd-display-ad-renderer,"
-                + "#player-ads,.ad-container,"
+                + "ytd-action-companion-ad-renderer,ytd-in-feed-ad-layout-renderer,"
+                + "ytd-banner-promo-renderer,ytm-companion-ad-renderer,"
+                + "ytm-promoted-video-renderer,#player-ads,.ad-container,"
                 + "ytm-promoted-sparkles-text-search-renderer,"
                 + "ytm-promoted-sparkles-web-renderer{display:none!important;height:0!important}';"
                 + "if(!document.getElementById('mytube-ad-css')){"
                 + "var s=document.createElement('style');s.id='mytube-ad-css';s.textContent=css;"
                 + "document.documentElement.appendChild(s);}"
-                + "if(!window.__mytubeAdTimer){window.__mytubeAdTimer=setInterval(function(){"
-                + "var skip=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,"
-                + ".ytp-skip-ad-button,.ytp-ad-skip-button-container button');"
-                + "if(skip){try{skip.click()}catch(e){}}"
-                + "},700);}"
+                + "window.__mytubeAdShield=function(){try{"
+                + "var buttons=document.querySelectorAll("
+                + "'.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,"
+                + ".ytp-ad-skip-button-container button,.ytp-ad-overlay-close-button,"
+                + "button[aria-label*=\\\"Skip\\\"],button[aria-label*=\\\"건너뛰기\\\"]');"
+                + "for(var i=0;i<buttons.length;i++){try{buttons[i].click()}catch(x){}}"
+                + "var player=document.querySelector('#movie_player,.html5-video-player');"
+                + "var showing=!!(player&&(player.classList.contains('ad-showing')"
+                + "||player.classList.contains('ad-interrupting')));"
+                + "var state=window.__mytubeAdPlayback;"
+                + "if(showing){var video=player.querySelector('video');"
+                + "if(video){if(!state||state.video!==video){state={video:video,"
+                + "muted:video.muted,volume:video.volume,rate:video.playbackRate};"
+                + "window.__mytubeAdPlayback=state;}"
+                + "try{video.muted=true;video.volume=0;video.playbackRate=16;}catch(x){}"
+                + "try{var d=video.duration;if(isFinite(d)&&d>0.1){video.currentTime=d;}}catch(x){}}"
+                + "for(var j=0;j<buttons.length;j++){try{buttons[j].click()}catch(x){}}"
+                + "}else if(state){try{if(state.video){state.video.muted=state.muted;"
+                + "state.video.volume=state.volume;state.video.playbackRate=state.rate||1;}}catch(x){}"
+                + "window.__mytubeAdPlayback=null;}"
+                + "}catch(e){}};"
+                + "if(!window.__mytubeAdTimer){window.__mytubeAdTimer=setInterval("
+                + "window.__mytubeAdShield,250);"
+                + "document.addEventListener('yt-navigate-finish',window.__mytubeAdShield,true);"
+                + "document.addEventListener('loadedmetadata',window.__mytubeAdShield,true);}"
+                + "window.__mytubeAdShield();"
                 + "}catch(e){}})();";
         webView.evaluateJavascript(js, null);
+    }
+
+    private static boolean isAdResourceUrl(String url) {
+        if (url == null || url.isEmpty()) return false;
+        String lower = url.toLowerCase(java.util.Locale.US);
+        return lower.contains("googleads.g.doubleclick.net")
+                || lower.contains("ad.doubleclick.net")
+                || lower.contains("static.doubleclick.net")
+                || lower.contains("googleadservices.com")
+                || lower.contains("googlesyndication.com")
+                || lower.contains("imasdk.googleapis.com")
+                || lower.contains("/pagead/")
+                || lower.contains("/api/stats/ads")
+                || lower.contains("/ptracking")
+                || lower.contains("/get_midroll_info");
     }
 
     private void removeLegacyDownloadFab() {

@@ -830,7 +830,7 @@ public final class MainActivity extends Activity {
         screen.addView(title);
 
         TextView version = new TextView(this);
-        version.setText("버전 My Tube 1.8.1");
+        version.setText("버전 My Tube " + BuildConfig.VERSION_NAME);
         version.setTextColor(Color.rgb(71, 85, 105));
         version.setTextSize(14);
         version.setPadding(dp(16), 0, dp(16), dp(10));

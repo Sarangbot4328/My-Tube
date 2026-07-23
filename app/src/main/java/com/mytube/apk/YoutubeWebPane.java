@@ -1,6 +1,7 @@
 package com.mytube.apk;
 
 import android.annotation.SuppressLint;
+import android.animation.LayoutTransition;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -65,6 +66,8 @@ final class YoutubeWebPane extends LinearLayout {
     private LinearLayout toolbar;
     private TextView titleView;
     private LinearLayout videoBar;
+    private LinearLayout videoBarContent;
+    private TextView videoBarToggle;
     private TextView videoLabel;
     private View customFullscreenView;
     private WebChromeClient.CustomViewCallback customFullscreenCallback;
@@ -73,6 +76,7 @@ final class YoutubeWebPane extends LinearLayout {
     private String currentVideoUrl = "";
     private String currentTitle = "";
     private boolean started;
+    private boolean videoBarExpanded;
 
     public YoutubeWebPane(Context context) {
         super(context);
@@ -212,19 +216,38 @@ final class YoutubeWebPane extends LinearLayout {
         stage.addView(webView, new FrameLayout.LayoutParams(-1, -1));
         addView(stage, new LayoutParams(-1, 0, 1));
 
-        // Bottom bar only — user taps «광고없이 재생» to open full app player.
+        // Collapsed by default so the web page keeps almost all available height.
         videoBar = new LinearLayout(context);
         videoBar.setOrientation(VERTICAL);
         videoBar.setBackgroundColor(Color.rgb(24, 24, 24));
-        videoBar.setPadding(dp(12), dp(10), dp(12), dp(10));
+        videoBar.setPadding(0, 0, 0, 0);
         videoBar.setVisibility(GONE);
+        LayoutTransition panelTransition = new LayoutTransition();
+        panelTransition.setDuration(180);
+        videoBar.setLayoutTransition(panelTransition);
+
+        videoBarToggle = new TextView(context);
+        videoBarToggle.setText("⌃");
+        videoBarToggle.setTextColor(Color.rgb(203, 213, 225));
+        videoBarToggle.setTextSize(20);
+        videoBarToggle.setGravity(Gravity.CENTER);
+        videoBarToggle.setBackgroundColor(Color.rgb(18, 18, 18));
+        videoBarToggle.setContentDescription("재생 메뉴 열기");
+        videoBarToggle.setOnClickListener(v ->
+                setVideoBarExpanded(!videoBarExpanded, true));
+        videoBar.addView(videoBarToggle, new LayoutParams(-1, dp(30)));
+
+        videoBarContent = new LinearLayout(context);
+        videoBarContent.setOrientation(VERTICAL);
+        videoBarContent.setPadding(dp(12), dp(4), dp(12), dp(10));
+        videoBarContent.setVisibility(GONE);
 
         videoLabel = new TextView(context);
         videoLabel.setTextColor(Color.rgb(203, 213, 225));
         videoLabel.setTextSize(12);
         videoLabel.setMaxLines(2);
         videoLabel.setPadding(0, 0, 0, dp(8));
-        videoBar.addView(videoLabel, new LayoutParams(-1, -2));
+        videoBarContent.addView(videoLabel, new LayoutParams(-1, -2));
 
         LinearLayout row = new LinearLayout(context);
         row.setOrientation(HORIZONTAL);
@@ -254,7 +277,8 @@ final class YoutubeWebPane extends LinearLayout {
         LayoutParams dlp = new LayoutParams(0, dp(48), 1);
         dlp.setMargins(dp(8), 0, 0, 0);
         row.addView(download, dlp);
-        videoBar.addView(row, new LayoutParams(-1, -2));
+        videoBarContent.addView(row, new LayoutParams(-1, -2));
+        videoBar.addView(videoBarContent, new LayoutParams(-1, -2));
         addView(videoBar, new LayoutParams(-1, -2));
     }
 
@@ -477,6 +501,7 @@ final class YoutubeWebPane extends LinearLayout {
         }
         boolean changed = !videoUrl.equals(currentVideoUrl);
         currentVideoUrl = videoUrl;
+        if (changed) setVideoBarExpanded(false, false);
         if (currentTitle.isEmpty() || "YouTube".equals(currentTitle)) {
             currentTitle = "YouTube 영상";
         }
@@ -490,7 +515,47 @@ final class YoutubeWebPane extends LinearLayout {
     }
 
     private void hideVideoBar() {
+        setVideoBarExpanded(false, false);
         videoBar.setVisibility(GONE);
+    }
+
+    private void setVideoBarExpanded(boolean expanded, boolean animate) {
+        if (videoBarContent == null || videoBarToggle == null) return;
+        videoBarExpanded = expanded;
+        videoBarToggle.setText(expanded ? "⌄" : "⌃");
+        videoBarToggle.setContentDescription(expanded ? "재생 메뉴 닫기" : "재생 메뉴 열기");
+        videoBarContent.animate().cancel();
+
+        if (!animate) {
+            videoBarContent.setAlpha(1f);
+            videoBarContent.setTranslationY(0f);
+            videoBarContent.setVisibility(expanded ? VISIBLE : GONE);
+            return;
+        }
+
+        if (expanded) {
+            videoBarContent.setAlpha(0f);
+            videoBarContent.setTranslationY(dp(14));
+            videoBarContent.setVisibility(VISIBLE);
+            videoBarContent.animate()
+                    .alpha(1f)
+                    .translationY(0f)
+                    .setDuration(180)
+                    .start();
+        } else {
+            videoBarContent.animate()
+                    .alpha(0f)
+                    .translationY(dp(14))
+                    .setDuration(150)
+                    .withEndAction(() -> {
+                        if (!videoBarExpanded) {
+                            videoBarContent.setVisibility(GONE);
+                            videoBarContent.setAlpha(1f);
+                            videoBarContent.setTranslationY(0f);
+                        }
+                    })
+                    .start();
+        }
     }
 
     private void injectAdShield() {

@@ -3,6 +3,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/my_tube_launcher"
+        android:roundIcon="@drawable/my_tube_launcher"
         android:usesCleartextTraffic="false"
         android:theme="@style/AppTheme"
         android:label="My Tube">

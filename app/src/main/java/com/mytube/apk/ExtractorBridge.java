@@ -424,6 +424,49 @@ final class ExtractorBridge {
                         + "로그인을 썼다면 설정에서 쿠키를 지우고 다시 로그인해 보세요.");
     }
 
+    static PlaybackData resolveBackgroundAudio(String url) throws Exception {
+        init();
+        PlaybackData data = resolveBackgroundAudioOnce(url);
+        if (data != null) return data;
+        if (CookieStore.hasAuthCookies()) {
+            CookieStore.setGuestMode(true);
+            try {
+                data = resolveBackgroundAudioOnce(url);
+                if (data != null) return data;
+            } finally {
+                CookieStore.setGuestMode(false);
+            }
+        }
+        throw new IllegalStateException("백그라운드 재생 스트림을 찾지 못했습니다.");
+    }
+
+    private static PlaybackData resolveBackgroundAudioOnce(String url) {
+        try {
+            StreamInfo info = StreamInfo.getInfo(ServiceList.YouTube, url);
+            AudioStream best = info.getAudioStreams().stream()
+                    .filter(stream -> stream.isUrl()
+                            && stream.getContent() != null
+                            && !stream.getContent().isEmpty())
+                    .max(Comparator.comparingInt(AudioStream::getAverageBitrate))
+                    .orElse(null);
+            if (best != null) {
+                return new PlaybackData(
+                        info.getName(),
+                        info.getUploaderName(),
+                        best.getContent(),
+                        false
+                );
+            }
+        } catch (Exception ignored) {
+            // Fall back to a muxed stream below.
+        }
+        try {
+            return innerTubeResolve(url);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private static PlaybackData resolveOnce(String url) {
         // 1) Bundled NewPipe extractor.
         try {

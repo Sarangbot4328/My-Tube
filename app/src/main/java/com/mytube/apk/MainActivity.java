@@ -183,6 +183,7 @@ public final class MainActivity extends Activity {
     private boolean webAutoplayActive;
     private boolean webVideoPage;
     private boolean webVideoPanelExpanded;
+    private boolean siteBackgroundRequested;
     private boolean defaultQualityApplied;
     private boolean playerControlsVisible = true;
     private String currentOfflineItemId = "";
@@ -1846,10 +1847,22 @@ public final class MainActivity extends Activity {
     public void onUserLeaveHint() {
         if (playing && !fullscreen && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             enterPopup();
-        } else if (currentScreen == SCREEN_SEARCH && youtubeWeb != null) {
-            youtubeWeb.armBackgroundPlayback();
+        } else {
+            startSiteBackgroundPlaybackIfNeeded();
         }
         super.onUserLeaveHint();
+    }
+
+    private void startSiteBackgroundPlaybackIfNeeded() {
+        if (siteBackgroundRequested || playing || currentScreen != SCREEN_SEARCH
+                || youtubeWeb == null || !youtubeWeb.isSiteVideoPlaying()) {
+            return;
+        }
+        siteBackgroundRequested = BackgroundPlaybackService.start(
+                this,
+                youtubeWeb.getCurrentVideoUrl(),
+                youtubeWeb.getCurrentTitle(),
+                youtubeWeb.getSiteVideoPositionMs());
     }
 
     @Override
@@ -1972,16 +1985,22 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        if (!playing && currentScreen == SCREEN_SEARCH && youtubeWeb != null) {
-            youtubeWeb.armBackgroundPlayback();
-        }
+        startSiteBackgroundPlaybackIfNeeded();
         super.onPause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (youtubeWeb != null) youtubeWeb.disarmBackgroundPlayback();
+        if (siteBackgroundRequested || BackgroundPlaybackService.hasPendingPlayback()) {
+            BackgroundPlaybackService.ResumeState state =
+                    BackgroundPlaybackService.takeResumeState(this);
+            siteBackgroundRequested = false;
+            if (state != null && youtubeWeb != null && !state.videoUrl.isEmpty()) {
+                youtubeWeb.resumeFromBackground(
+                        state.videoUrl, state.positionMs, state.shouldPlay);
+            }
+        }
         updateBottomNavVisibility(false);
     }
 

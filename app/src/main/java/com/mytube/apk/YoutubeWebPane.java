@@ -24,6 +24,7 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
 import org.json.JSONTokener;
 
 import java.io.ByteArrayInputStream;
@@ -59,7 +60,7 @@ final class YoutubeWebPane extends LinearLayout {
         @Override
         public void run() {
             pollUrlFromJs();
-            mainHandler.postDelayed(this, 900);
+            mainHandler.postDelayed(this, 500);
         }
     };
 
@@ -81,6 +82,11 @@ final class YoutubeWebPane extends LinearLayout {
     private String currentTitle = "";
     private boolean started;
     private boolean videoBarExpanded;
+    private boolean siteVideoPlaying;
+    private long siteVideoPositionMs;
+    private String pendingResumeUrl = "";
+    private long pendingResumePositionMs;
+    private boolean pendingResumeShouldPlay;
 
     public YoutubeWebPane(Context context) {
         super(context);
@@ -225,8 +231,8 @@ final class YoutubeWebPane extends LinearLayout {
                 currentUrl = url == null ? "" : url;
                 onUrlMaybeVideo(currentUrl, true);
                 injectAdShield();
-                injectBackgroundPlayback();
                 removeLegacyDownloadFab();
+                applyPendingBackgroundResume();
             }
         });
         stage.addView(webView, new FrameLayout.LayoutParams(-1, -1));
@@ -352,23 +358,31 @@ final class YoutubeWebPane extends LinearLayout {
         mainHandler.postDelayed(urlPoller, 500);
     }
 
-    void armBackgroundPlayback() {
-        if (webView == null || currentVideoUrl.isEmpty()) return;
-        webView.evaluateJavascript(
-                "(function(){try{var v=document.querySelector("
-                        + "'#movie_player video,video.html5-main-video,video');"
-                        + "if(v&&!v.paused&&!v.ended){window.__mytubeBgVideo=v;"
-                        + "window.__mytubeBgArmed=true;try{v.play()}catch(e){}}"
-                        + "}catch(e){}})();",
-                null);
+    boolean isSiteVideoPlaying() {
+        return siteVideoPlaying && !currentVideoUrl.isEmpty();
     }
 
-    void disarmBackgroundPlayback() {
-        if (webView == null) return;
-        webView.evaluateJavascript(
-                "(function(){window.__mytubeBgArmed=false;"
-                        + "window.__mytubeBgVideo=null;})()",
-                null);
+    long getSiteVideoPositionMs() {
+        return Math.max(0L, siteVideoPositionMs);
+    }
+
+    void resumeFromBackground(
+            String videoUrl, long positionMs, boolean shouldPlay) {
+        if (webView == null || videoUrl == null || videoUrl.isEmpty()) return;
+        pendingResumeUrl = normalizeVideoUrl(videoUrl);
+        if (pendingResumeUrl.isEmpty()) pendingResumeUrl = videoUrl;
+        pendingResumePositionMs = Math.max(0L, positionMs);
+        pendingResumeShouldPlay = shouldPlay;
+        siteVideoPositionMs = pendingResumePositionMs;
+        siteVideoPlaying = shouldPlay;
+        webView.onResume();
+        String currentId = ExtractorBridge.videoIdOf(currentVideoUrl);
+        String resumeId = ExtractorBridge.videoIdOf(pendingResumeUrl);
+        if (!resumeId.isEmpty() && !resumeId.equals(currentId)) {
+            webView.loadUrl(pendingResumeUrl);
+            return;
+        }
+        applyPendingBackgroundResume();
     }
 
     void destroy() {
@@ -424,12 +438,56 @@ final class YoutubeWebPane extends LinearLayout {
     private void pollUrlFromJs() {
         if (webView == null) return;
         webView.evaluateJavascript(
-                "(function(){try{return location.href}catch(e){return ''}})()",
+                "(function(){try{var v=document.querySelector("
+                        + "'#movie_player video,video.html5-main-video,video');"
+                        + "return JSON.stringify({href:location.href,title:document.title||'',"
+                        + "position:v&&isFinite(v.currentTime)?v.currentTime:0,"
+                        + "playing:!!(v&&!v.paused&&!v.ended)});"
+                        + "}catch(e){return '{}'}})()",
                 value -> {
-                    String href = stripJsString(value);
-                    if (href.isEmpty()) return;
-                    mainHandler.post(() -> onUrlMaybeVideo(href, true));
+                    try {
+                        Object decoded = new JSONTokener(
+                                value == null ? "\"{}\"" : value).nextValue();
+                        String json = decoded instanceof String
+                                ? (String) decoded : String.valueOf(decoded);
+                        JSONObject snapshot = new JSONObject(json);
+                        String href = snapshot.optString("href", "");
+                        String title = snapshot.optString("title", "")
+                                .replace(" - YouTube", "").trim();
+                        long positionMs = Math.max(0L,
+                                Math.round(snapshot.optDouble("position", 0d) * 1000d));
+                        boolean isPlaying = snapshot.optBoolean("playing", false);
+                        mainHandler.post(() -> {
+                            if (!title.isEmpty()) currentTitle = title;
+                            if (!href.isEmpty()) onUrlMaybeVideo(href, true);
+                            siteVideoPositionMs = positionMs;
+                            siteVideoPlaying = isPlaying;
+                        });
+                    } catch (Exception ignored) {
+                        // Keep the last playback snapshot if YouTube is navigating.
+                    }
                 });
+    }
+
+    private void applyPendingBackgroundResume() {
+        if (webView == null || pendingResumeUrl.isEmpty()) return;
+        final long positionMs = pendingResumePositionMs;
+        final boolean shouldPlay = pendingResumeShouldPlay;
+        pendingResumeUrl = "";
+        pendingResumePositionMs = 0L;
+        pendingResumeShouldPlay = false;
+        double seconds = positionMs / 1000d;
+        String js = "(function(){var attempts=0;function resume(){try{"
+                + "var v=document.querySelector("
+                + "'#movie_player video,video.html5-main-video,video');"
+                + "if(!v){if(attempts++<30)setTimeout(resume,250);return;}"
+                + "if(isFinite(" + seconds + ")&&Math.abs(v.currentTime-"
+                + seconds + ")>1.5)v.currentTime=" + seconds + ";"
+                + (shouldPlay
+                        ? "var p=v.play();if(p&&p.catch)p.catch(function(){});"
+                        : "v.pause();")
+                + "}catch(e){if(attempts++<30)setTimeout(resume,250);}}resume();})()";
+        webView.evaluateJavascript(js, null);
     }
 
     /**
@@ -536,7 +594,11 @@ final class YoutubeWebPane extends LinearLayout {
         }
         boolean changed = !videoUrl.equals(currentVideoUrl);
         currentVideoUrl = videoUrl;
-        if (changed) setVideoBarExpanded(false, false);
+        if (changed) {
+            siteVideoPlaying = false;
+            siteVideoPositionMs = 0L;
+            setVideoBarExpanded(false, false);
+        }
         if (currentTitle.isEmpty() || "YouTube".equals(currentTitle)) {
             currentTitle = "YouTube 영상";
         }
@@ -642,36 +704,6 @@ final class YoutubeWebPane extends LinearLayout {
         webView.evaluateJavascript(js, null);
     }
 
-    private void injectBackgroundPlayback() {
-        if (webView == null) return;
-        String js = "(function(){try{if(window.__mytubeBgInstalled)return;"
-                + "window.__mytubeBgInstalled=true;"
-                + "var nativePause=HTMLMediaElement.prototype.pause;"
-                + "HTMLMediaElement.prototype.pause=function(){"
-                + "if(window.__mytubeBgArmed&&window.__mytubeBgVideo===this)return;"
-                + "return nativePause.apply(this,arguments);};"
-                + "window.__mytubeBgKeepAlive=function(){try{"
-                + "var v=window.__mytubeBgVideo;"
-                + "if(window.__mytubeBgArmed&&v&&!v.ended&&v.paused){"
-                + "var p=v.play();if(p&&p.catch)p.catch(function(){});}"
-                + "}catch(e){}};"
-                + "if(!window.__mytubeBgTimer){window.__mytubeBgTimer=setInterval("
-                + "window.__mytubeBgKeepAlive,750);}"
-                + "document.addEventListener('play',function(e){"
-                + "if(e.target instanceof HTMLMediaElement){"
-                + "window.__mytubeLastPlaying=e.target;}},true);"
-                + "document.addEventListener('visibilitychange',function(){"
-                + "if(document.hidden){var v=window.__mytubeLastPlaying||"
-                + "document.querySelector('#movie_player video,video.html5-main-video,video');"
-                + "if(v&&!v.paused&&!v.ended){window.__mytubeBgVideo=v;"
-                + "window.__mytubeBgArmed=true;}"
-                + "if(window.__mytubeBgArmed){"
-                + "Promise.resolve().then(window.__mytubeBgKeepAlive);"
-                + "setTimeout(window.__mytubeBgKeepAlive,100);}}},true);"
-                + "}catch(e){}})();";
-        webView.evaluateJavascript(js, null);
-    }
-
     private static boolean isAdResourceUrl(String url) {
         if (url == null || url.isEmpty()) return false;
         String lower = url.toLowerCase(java.util.Locale.US);
@@ -713,16 +745,6 @@ final class YoutubeWebPane extends LinearLayout {
         String id = ExtractorBridge.videoIdOf(videoUrl);
         if (id.isEmpty()) return "";
         return "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg";
-    }
-
-    private static String stripJsString(String value) {
-        if (value == null || value.equals("null")) return "";
-        String s = value.trim();
-        if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
-            s = s.substring(1, s.length() - 1);
-            s = s.replace("\\/", "/").replace("\\\"", "\"").replace("\\u003d", "=");
-        }
-        return s;
     }
 
     private int dp(int v) {
